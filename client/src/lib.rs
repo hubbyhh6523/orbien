@@ -10,6 +10,5 @@ mod tunnel;
 pub use handle::{ClientHandle, ClientStatus};
 pub use orbien_core::config::{resolve_client_config_path, ClientConfig};
 pub use service::Service;
-pub use tunnel::run_p2p_udp_session;
 
 pub use orbien_core::VERSION;
