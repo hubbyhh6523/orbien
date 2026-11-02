@@ -21,11 +21,6 @@
 //! The local UDP socket is wrapped in [`UdpStreamAdapter`] so that
 //! `io::join` can write *into* it (KCP → backend direction) as well as
 //! read from it (backend → KCP direction).
-//!
-//! ## UDP legacy (experimental — kept for lab use)
-//!
-//! [`run_p2p_udp_session_experimental`] is the original raw forwarder.
-//! It is deprecated and **not called from any production path**.
 
 use anyhow::{anyhow, Result};
 use orbien_core::io;
@@ -198,11 +193,10 @@ pub async fn run_p2p_udp_session(
 /// [`kcp_tokio::KcpConfig`].
 ///
 /// # Visibility
-/// `pub(crate)` — reachable from tests inside this crate (including
-/// integration tests in `client/tests/`) but not exported as a stable public
-/// API.  Callers that need the production defaults should use
-/// [`run_p2p_udp_session`].  Tests that need a short `connect_timeout` for
-/// deterministic failure assertions should call this function directly.
+/// `pub(crate)` — reachable only from unit tests inside this crate
+/// (`mod tests` below).  It is **not** visible to the integration tests in
+/// `client/tests/`, which are a separate crate.  Callers that need the
+/// production defaults should use [`run_p2p_udp_session`].
 ///
 /// # Design
 /// A `KcpStream` is layered on the punched socket to provide ordering and
@@ -300,64 +294,6 @@ pub(crate) async fn run_p2p_udp_session_with_config(
     Ok(())
 }
 
-// ───────────────────────────────────────────────────────────────────
-// UDP — EXPERIMENTAL, DEPRECATED
-//
-// Kept for lab/integration reference.  DO NOT call from production.
-// Use run_p2p_udp_session (above) for all new code.
-// ───────────────────────────────────────────────────────────────────
-
-/// **DEPRECATED — use [`run_p2p_udp_session`] instead.**
-///
-/// Raw bidirectional UDP packet forwarder.  No framing, no reliability,
-/// no flow control.  Retained for lab/integration reference only.
-#[deprecated(
-    since = "0.2.0",
-    note = "use run_p2p_udp_session (KCP-backed) for production UDP tunnels"
-)]
-#[allow(dead_code)]
-pub async fn run_p2p_udp_session_experimental(
-    p2p_sock: UdpSocket,
-    local_svc: SocketAddr,
-    buf_size: usize,
-) -> Result<()> {
-    use tokio::net::UdpSocket as TokioUdp;
-
-    let local_sock = TokioUdp::bind("127.0.0.1:0").await?;
-    local_sock.connect(local_svc).await?;
-
-    let p2p = Arc::new(p2p_sock);
-    let local = Arc::new(local_sock);
-
-    let p2p_r = Arc::clone(&p2p);
-    let local_w = Arc::clone(&local);
-    let p2p_to_local = tokio::spawn(async move {
-        let mut buf = vec![0u8; buf_size];
-        while let Ok(n) = p2p_r.recv(&mut buf).await {
-            if local_w.send(&buf[..n]).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let local_r = Arc::clone(&local);
-    let p2p_w = Arc::clone(&p2p);
-    let local_to_p2p = tokio::spawn(async move {
-        let mut buf = vec![0u8; buf_size];
-        while let Ok(n) = local_r.recv(&mut buf).await {
-            if p2p_w.send(&buf[..n]).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = p2p_to_local => {}
-        _ = local_to_p2p => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,16 +302,6 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::time::{timeout, Duration};
     use tokio_util::sync::CancellationToken;
-
-    /// Verify the deprecated experimental UDP helper still compiles.
-    #[test]
-    #[allow(deprecated)]
-    #[allow(clippy::type_complexity)]
-    fn udp_experimental_fn_exists() {
-        let _: fn(UdpSocket, SocketAddr, usize) ->
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
-            |s, a, b| Box::pin(run_p2p_udp_session_experimental(s, a, b));
-    }
 
     // ── helpers ────────────────────────────────────────────────────────────
 
@@ -483,58 +409,6 @@ mod tests {
         assert!(msg.contains("test-tunnel"), "error should mention tunnel name; got: {msg}");
     }
 
-    // ── TCP test 3: cancellation ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn cancellation_token_stops_background_task_without_leak() {
-        let cancel = CancellationToken::new();
-        let child = cancel.child_token();
-
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = child.cancelled() => "cancelled",
-                _ = std::future::pending::<()>() => "unreachable",
-            }
-        });
-
-        cancel.cancel();
-        let outcome = timeout(Duration::from_secs(1), task)
-            .await.expect("task did not stop within 1s").unwrap();
-        assert_eq!(outcome, "cancelled");
-    }
-
-    // ── UDP test 1: function signature compiles and type-checks ─────────────
-    #[tokio::test]
-    async fn udp_session_production_fn_exists() {
-        // Just type-check that the function is callable with the expected
-        // signature; no runtime behaviour is exercised.
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _fut = run_p2p_udp_session(
-            sock,
-            "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
-            "sig-check",
-        );
-        let _: &dyn std::future::Future<Output = Result<()>> = &_fut;
-    }
-
-    // ── UDP test 1b: with_config variant is reachable from test module ──────
-    //
-    // Verifies the pub(crate) helper compiles and has the expected signature.
-    // Does not exercise any runtime behaviour — that is covered by the
-    // kcp_fail test below.
-    #[tokio::test]
-    async fn udp_session_with_config_fn_exists() {
-        use kcp_tokio::KcpConfig;
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _fut = run_p2p_udp_session_with_config(
-            sock,
-            "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
-            "sig-check",
-            KcpConfig::default(),
-        );
-        let _: &dyn std::future::Future<Output = Result<()>> = &_fut;
-    }
-
     // ── UDP test 2: unreachable backend returns Err ─────────────────────────
     //
     // sock_a is connected to sock_b (which is not a KCP peer), so
@@ -563,32 +437,6 @@ mod tests {
             result.is_err(),
             "expected Err when backend is unreachable; got Ok"
         );
-    }
-
-    // ── UDP test 3: cancellation exits within deadline ──────────────────────
-    //
-    // Verifies the tokio::select! + CancellationToken pattern used in
-    // session.rs to wrap run_p2p_udp_session.  The function itself is not
-    // called here because KCP handshake requires a live peer; the cancellation
-    // contract is transport-independent.
-    #[tokio::test]
-    async fn udp_session_cancellation_exits_within_deadline() {
-        let cancel = CancellationToken::new();
-        let child = cancel.child_token();
-
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = child.cancelled() => "cancelled",
-                _ = std::future::pending::<()>() => "unreachable",
-            }
-        });
-
-        cancel.cancel();
-        let outcome = timeout(Duration::from_secs(1), task)
-            .await
-            .expect("UDP task did not stop within 1s after cancellation")
-            .unwrap();
-        assert_eq!(outcome, "cancelled");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -646,19 +494,14 @@ mod tests {
         );
     }
 
-    // ── 控制面测试 2：KCP connect 失败时，错误信息含 tunnel_name ──────────
+    // ── 控制面测试 2：KCP 对端静默时，会话可通过取消干净退出 ───────────────
 
-    /// `peer_addr()` 成功（socket 已 connect）但 KCP 握手无法完成时，
-    /// `run_p2p_udp_session_with_config` 必须在 `connect_timeout` 内返回
-    /// `Err`，且错误信息包含 tunnel_name。
-    ///
-    /// 使用 `run_p2p_udp_session_with_config`（`pub(crate)` helper）并注入
-    /// 新 API `connect_with_transport` 不等待握手即返回，因此对静默对端
-    /// 不会快速失败——会话会进入 `io::join` 并因 UDP 无 EOF 而一直挂起。
-    /// 本测试验证：对不可达后端，会话可通过取消干净退出（不泄漏任务），
-    /// 这是当前 API 下可测试的真实行为。
+    /// `peer_addr()` 成功（socket 已 connect）但对端不回应 KCP 握手时，
+    /// `kcp-tokio` 0.7 的 `connect_with_transport` 不等待握手即返回，
+    /// 会话会进入 `io::join` 并因 UDP 无 EOF 而一直挂起，不会返回 Err。
+    /// 本测试验证：此时外层取消能让任务在 1 秒内以 Ok 退出，不泄漏任务。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_session_kcp_fail_err_contains_tunnel_name() {
+    async fn udp_session_cancel_exits_cleanly_when_kcp_peer_silent() {
         use kcp_tokio::KcpConfig;
 
         // sock_a connected → sock_b；sock_b 不做任何 KCP 响应
