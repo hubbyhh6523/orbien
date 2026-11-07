@@ -1,0 +1,52 @@
+TencentDB Agent Memory / Octop documentation static check
+Date context: 2026-11-07
+
+Purpose
+-------
+Documentation-only commit to docs/tdai-ubuntu-install in hubbyhh6523/orbien.
+No changes to main or application code are intended.
+
+Current-turn checks actually performed
+-------------------------------------
+Docker CLI lookup: unavailable.
+Selected Bash examples: 8 passed bash -n.
+Embedded Python smoke example: ast.parse passed.
+Python heredoc wrapper: bash -n passed (included in the 8 examples).
+TDAI fixed-commit start-all.sh: read through GitHub integration.
+Repository root AGENTS.md and docs directory structure: inspected.
+
+Selected Bash examples checked
+-----------------------------
+1. Clone, source version display and non-overwriting environment setup.
+2. Existing-network guard and loopback-default bridge creation.
+3. verify.sh / start-all.sh command syntax.
+4. Container inspection and default health endpoints.
+5. Git ignore / tracked-secret-path inspection commands.
+6. Proxy/Core log inspection commands.
+7. stop-all.sh command syntax.
+8. Python heredoc smoke example.
+
+Prior audit context (not rerun in this turn)
+------------------------------------------
+TDAI source snapshot: 2002196f2d7c22ea267cfcaf67c5a6fa861df681.
+Octop source snapshot: 4022e24ef6c34e9716350872b0e93bfaae7a20c3.
+The conversation records prior source/ignore checks and upstream shell syntax checks.
+The previous sandbox files are not available in this turn; this record does not
+pretend those checks were rerun. GitHub-readable fixed-commit links are included
+in the guide rather than chat-only citation identifiers.
+
+Not executed
+------------
+Docker installation or daemon validation on the target Ubuntu host.
+Docker network creation, image pull or container startup.
+Actual verify.sh / start-all.sh execution.
+Dashboard login, health requests or API-key configuration.
+Any external model request, Proxy smoke request or Octop E2E request.
+SSE streaming, identity registration, L0 writes, L1 extraction or memory injection.
+
+Interpretation
+--------------
+Syntax success does not prove shell commands, Docker configuration, providers
+or memory semantics work at runtime. All deployment/E2E acceptance items remain
+unexecuted. No API keys, local generated runtime configuration or raw user
+conversation logs are included in this commit.
