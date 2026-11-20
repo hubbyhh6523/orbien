@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use httparse::Status;
 use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use orbien_core::msg::NewTunnel;
+use orbien_core::net::http_head::{rewrite_request_head, Rewrite};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -188,9 +189,17 @@ async fn handle_http_ingress(
     };
 
     let mut raw = head.raw;
-    if !route.host_header_rewrite.is_empty() {
-        rewrite_host_header(&mut raw, &route.host_header_rewrite)?;
-    }
+    rewrite_request_head(
+        &mut raw,
+        &Rewrite {
+            host: if route.host_header_rewrite.is_empty() {
+                None
+            } else {
+                Some(route.host_header_rewrite.as_str())
+            },
+            ..Default::default()
+        },
+    )?;
 
     orbien_core::net::apply_x_forwarded_for(&mut raw, &ingress.source.ip().to_string(), "http")?;
 
@@ -324,39 +333,6 @@ fn host_from_absolute_target(target: &str) -> Option<String> {
     } else {
         Some(hostport.to_string())
     }
-}
-
-fn rewrite_host_header(buf: &mut Vec<u8>, new_host: &str) -> Result<()> {
-    let lower = b"host:";
-    let text = String::from_utf8_lossy(buf);
-    let mut out = String::new();
-    let mut replaced = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed_start = line.trim_start_matches([' ', '\t']);
-        if !replaced
-            && trimmed_start.len() >= 5
-            && trimmed_start.as_bytes()[..5].eq_ignore_ascii_case(lower)
-        {
-            let ending = if line.ends_with("\r\n") {
-                "\r\n"
-            } else if line.ends_with('\n') {
-                "\n"
-            } else {
-                ""
-            };
-            out.push_str("Host: ");
-            out.push_str(new_host);
-            out.push_str(ending);
-            replaced = true;
-        } else {
-            out.push_str(line);
-        }
-    }
-    if !replaced {
-        return Err(anyhow!("Host header not found for rewrite"));
-    }
-    *buf = out.into_bytes();
-    Ok(())
 }
 
 pub async fn write_not_found<W: AsyncWrite + Unpin>(stream: &mut W) {
