@@ -113,22 +113,24 @@ fn parse_head(buf: &[u8]) -> Result<Head> {
         ensure!(!line.contains(&b'\r'), "bare CR in HTTP head");
         pos += n + 1;
 
-        if first.is_none() {
+        if let Some(first_line) = first {
+            if line.is_empty() {
+                return Ok(Head {
+                    first: first_line,
+                    fields,
+                    end: pos,
+                });
+            }
+            ensure!(fields.len() < MAX_FIELDS, "too many HTTP fields");
+            fields.push(field(line)?);
+            first = Some(first_line);
+        } else {
             ensure!(!line.is_empty(), "missing start line");
             ensure!(
                 line.iter().all(|&b| b >= 0x20 && b != 0x7f),
                 "invalid start line"
             );
             first = Some(line.to_vec());
-        } else if line.is_empty() {
-            return Ok(Head {
-                first: first.unwrap(),
-                fields,
-                end: pos,
-            });
-        } else {
-            ensure!(fields.len() < MAX_FIELDS, "too many HTTP fields");
-            fields.push(field(line)?);
         }
     }
 }
