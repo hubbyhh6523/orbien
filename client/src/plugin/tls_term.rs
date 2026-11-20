@@ -3,11 +3,14 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use httparse::Status;
 use orbien_core::config::PluginConfig;
+use orbien_core::net::http_forward::{
+    forward_one, validate_single_request, ForwardLimits,
+};
 use orbien_core::net::http_head::{
     rewrite_request_head, validate_rewrite_config, Rewrite,
 };
 use orbien_core::tls::load_or_generate_https_server_config;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -87,19 +90,14 @@ impl Plugin for TlsTermPlugin {
     }
 
     async fn handle(&self, conn: ConnectionInfo) -> Result<()> {
-        let tls = self
+        let mut tls = self
             .acceptor
             .accept(conn.stream)
             .await
             .map_err(|e| anyhow!("tls-term TLS accept failed: {e}"))?;
 
-        let mut local = TcpStream::connect(&self.local_addr)
-            .await
-            .map_err(|e| anyhow!("tls-term dial {}: {e}", self.local_addr))?;
-        orbien_core::net::enable_nodelay(&local);
+        let mut head = read_http_request_head(&mut tls).await?;
 
-        let (mut tls_r, mut tls_w) = tokio::io::split(tls);
-        let mut head = read_http_request_head(&mut tls_r).await?;
         rewrite_request_head(
             &mut head,
             &Rewrite {
@@ -113,27 +111,29 @@ impl Plugin for TlsTermPlugin {
             },
         )?;
 
-        orbien_core::net::apply_x_forwarded_for(&mut head, &conn.src_addr, "https")?;
-        local.write_all(&head).await?;
+        orbien_core::net::apply_x_forwarded_for(
+            &mut head,
+            &conn.src_addr,
+            "https",
+        )?;
+        validate_single_request(&head)?;
 
-        tracing::debug!(
-            local = %self.local_addr,
-            src = %format!("{}:{}", conn.src_addr, conn.src_port),
-            "tls-term joining decrypted <-> local HTTP"
-        );
+        let local = TcpStream::connect(&self.local_addr)
+            .await
+            .map_err(|e| anyhow!("tls-term dial {}: {e}", self.local_addr))?;
+        orbien_core::net::enable_nodelay(&local);
 
-        let (mut local_r, mut local_w) = tokio::io::split(local);
-        let _ = tokio::try_join!(
-            async move { tokio::io::copy(&mut local_r, &mut tls_w).await },
-            async move { tokio::io::copy(&mut tls_r, &mut local_w).await },
-        );
+        forward_one(tls, local, head, ForwardLimits::default()).await?;
         Ok(())
     }
 }
 
-async fn read_http_request_head<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Vec<u8>> {
+async fn read_http_request_head<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
+
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
@@ -143,8 +143,10 @@ async fn read_http_request_head<R: AsyncReadExt + Unpin>(stream: &mut R) -> Resu
         if buf.len() > 64 * 1024 {
             bail!("http headers too large");
         }
+
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
+
         match req.parse(&buf)? {
             Status::Complete(_) => return Ok(buf),
             Status::Partial => continue,
