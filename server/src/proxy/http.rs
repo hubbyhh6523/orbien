@@ -7,6 +7,10 @@ use anyhow::{anyhow, bail, Result};
 use httparse::Status;
 use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use orbien_core::msg::NewProxy;
+use orbien_core::net::http_forward::{
+    forward_one, validate_single_request, ForwardLimits,
+};
+use orbien_core::net::http_head::{rewrite_request_head, Rewrite};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -126,9 +130,17 @@ async fn handle_http_visitor(
     access: Arc<AccessPolicy>,
 ) -> Result<()> {
     let mut visitor = prepare_visitor(stream, peer, &access).await?;
-    let (mut head, host, path) = read_http_request_head(&mut visitor.stream).await?;
+    let (mut head, host, path) =
+        read_http_request_head(&mut visitor.stream).await?;
+
     let Some(route) = vhost.lookup(&host, &path).await else {
-        tracing::debug!(peer = %visitor.peer, visitor = %visitor.visitor, %host, %path, "http no route");
+        tracing::debug!(
+            peer = %visitor.peer,
+            visitor = %visitor.visitor,
+            %host,
+            %path,
+            "http no route"
+        );
         write_not_found(&mut visitor.stream).await;
         return Ok(());
     };
@@ -150,11 +162,24 @@ async fn handle_http_visitor(
     }
     let _limit_guard = ConnGuard(Arc::clone(&route.active_conns));
 
-    if !route.host_header_rewrite.is_empty() {
-        rewrite_host_header(&mut head, &route.host_header_rewrite)?;
-    }
+    rewrite_request_head(
+        &mut head,
+        &Rewrite {
+            host: if route.host_header_rewrite.is_empty() {
+                None
+            } else {
+                Some(route.host_header_rewrite.as_str())
+            },
+            ..Default::default()
+        },
+    )?;
 
-    orbien_core::net::apply_x_forwarded_for(&mut head, &visitor.visitor.ip().to_string(), "http")?;
+    orbien_core::net::apply_x_forwarded_for(
+        &mut head,
+        &visitor.visitor.ip().to_string(),
+        "http",
+    )?;
+    validate_single_request(&head)?;
 
     let work = match control.get_work_conn().await {
         Ok(w) => w,
@@ -163,6 +188,7 @@ async fn handle_http_visitor(
             return Err(e);
         }
     };
+
     let work = control
         .start_work_conn(
             work,
@@ -177,28 +203,27 @@ async fn handle_http_visitor(
         )
         .await?;
 
-    let mut work = maybe_limit(work, route.limiter.clone());
-    let head_len = head.len() as u64;
-    work.write_all(&head).await?;
-    tracing::debug!(
-        proxy = %route.proxy_name,
-        %host,
-        %path,
-        peer = %visitor.peer,
-        visitor = %visitor.visitor,
-        "http joining visitor <-> work"
-    );
+    let work = maybe_limit(work, route.limiter.clone());
     let _guard = control.metrics.track_connection(&route.proxy_name, "http");
-    let (to_work, from_work, err) = orbien_core::io::join_counted(visitor.stream, work).await;
-    control
-        .metrics
-        .add_traffic_in(&route.proxy_name, "http", to_work.saturating_add(head_len));
-    control
-        .metrics
-        .add_traffic_out(&route.proxy_name, "http", from_work);
-    if let Some(e) = err {
-        tracing::debug!(proxy = %route.proxy_name, error = %e, "http join ended");
-    }
+
+    let stats = forward_one(
+        visitor.stream,
+        work,
+        head,
+        ForwardLimits::default(),
+    )
+    .await?;
+
+    control.metrics.add_traffic_in(
+        &route.proxy_name,
+        "http",
+        stats.to_upstream,
+    );
+    control.metrics.add_traffic_out(
+        &route.proxy_name,
+        "http",
+        stats.to_visitor,
+    );
     Ok(())
 }
 
@@ -207,6 +232,7 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
 ) -> Result<(Vec<u8>, String, String)> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
+
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
@@ -219,6 +245,7 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
 
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
+
         match req.parse(&buf)? {
             Status::Complete(_) => {
                 let host = req
@@ -228,44 +255,12 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
                     .map(|h| String::from_utf8_lossy(h.value).into_owned())
                     .ok_or_else(|| anyhow!("missing Host header"))?;
                 let path = req.path.unwrap_or("/").to_string();
+
                 return Ok((buf, normalize_host(&host), path));
             }
             Status::Partial => continue,
         }
     }
-}
-
-fn rewrite_host_header(buf: &mut Vec<u8>, new_host: &str) -> Result<()> {
-    let lower = b"host:";
-    let text = String::from_utf8_lossy(buf);
-    let mut out = String::new();
-    let mut replaced = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed_start = line.trim_start_matches([' ', '\t']);
-        if !replaced
-            && trimmed_start.len() >= 5
-            && trimmed_start.as_bytes()[..5].eq_ignore_ascii_case(lower)
-        {
-            let ending = if line.ends_with("\r\n") {
-                "\r\n"
-            } else if line.ends_with('\n') {
-                "\n"
-            } else {
-                ""
-            };
-            out.push_str("Host: ");
-            out.push_str(new_host);
-            out.push_str(ending);
-            replaced = true;
-        } else {
-            out.push_str(line);
-        }
-    }
-    if !replaced {
-        return Err(anyhow!("Host header not found for rewrite"));
-    }
-    *buf = out.into_bytes();
-    Ok(())
 }
 
 pub async fn write_not_found<W: AsyncWrite + Unpin>(stream: &mut W) {

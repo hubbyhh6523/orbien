@@ -1,3 +1,5 @@
+pub mod http_forward;
+pub mod http_head;
 mod proxy_protocol;
 mod tcp;
 mod xff;
