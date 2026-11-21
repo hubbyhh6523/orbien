@@ -4,6 +4,13 @@ mod stream;
 mod tls;
 mod websocket;
 mod yamux_mux;
+
+/// Validate QUIC crypto without creating an endpoint or a Tokio runtime.
+pub fn check_quic_client_crypto(cfg: rustls::ClientConfig) -> anyhow::Result<()> {
+    quinn::crypto::rustls::QuicClientConfig::try_from(cfg)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("QuicClientConfig: {e}"))
+}
 #[cfg(test)]
 mod yamux_mux_test;
 mod tofu_test;
