@@ -76,7 +76,7 @@ jobs:
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            libgl1-mesa-dev
+            libgl1-mesa-dev openssl
 
       - name: Install OpenSSL (Windows)
         if: runner.os == 'Windows'
@@ -87,6 +87,17 @@ jobs:
           Add-Content $env:GITHUB_ENV "OPENSSL_DIR=$vcpkgRoot/installed/x64-windows-static-md"
           Add-Content $env:GITHUB_ENV "OPENSSL_STATIC=1"
           Add-Content $env:GITHUB_ENV "OPENSSL_NO_VENDOR=1"
+
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: "3.12"
+
+      - name: Strict configuration checks (offline)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p orbien-server -p orbien-client --bins --locked
+          python3 scripts/check-configs.py --bin-dir target/debug
 
       - name: cargo test
         run: cargo test --workspace --locked
