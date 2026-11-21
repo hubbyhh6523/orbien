@@ -5,6 +5,8 @@ mod routes;
 mod security;
 #[cfg(test)]
 mod routes_test;
+#[cfg(test)]
+mod config_reload_test;
 
 use crate::service::Service;
 use anyhow::Result;

@@ -1,0 +1,10 @@
+# expect-error: protected
+[[tunnels]]
+name = "web"
+protocol = "https"
+domains = ["web.example"]
+[tunnels.plugin]
+type = "tls-term"
+service = "127.0.0.1:8080"
+[tunnels.plugin.requestHeaders.set]
+X-Forwarded-Proto = "https"

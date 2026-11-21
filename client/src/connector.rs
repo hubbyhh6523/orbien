@@ -11,6 +11,20 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+pub(crate) fn check_tls_config(cfg: &ClientConfig) -> Result<()> {
+    let tls = TlsDialOpts::from_config(cfg)?;
+    if tls.enable {
+        rustls::pki_types::ServerName::try_from(tls.server_name.clone())
+            .map_err(|e| anyhow!("invalid transport.tls.serverName: {e}"))?;
+    }
+    if matches!(cfg.protocol()?, Protocol::Quic) {
+        let mut crypto = (*tls.cfg).clone();
+        crypto.alpn_protocols = vec![orbien_core::transport::ALPN_ORBIEN.to_vec()];
+        orbien_core::transport::check_quic_client_crypto(crypto)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait Connector: Send + Sync {
     async fn open(&self) -> Result<DynStream>;

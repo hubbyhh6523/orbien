@@ -157,7 +157,7 @@ impl ClientHandle {
 
     pub async fn run_foreground(self, mut cfg: ClientConfig, config_path: PathBuf) -> Result<()> {
         cfg.prepare_runtime(&config_path);
-        cfg.validate()?;
+        crate::check_config(&cfg)?;
         let cancel = CancellationToken::new();
         self.set_status(ClientStatus::Starting);
         self.set_error(None);
@@ -198,7 +198,7 @@ impl ClientHandle {
             bail!("client already running");
         }
         cfg.prepare_runtime(&config_path);
-        cfg.validate()?;
+        crate::check_config(&cfg)?;
         let cancel = CancellationToken::new();
         *self.inner.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
         self.set_status(ClientStatus::Starting);

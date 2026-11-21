@@ -1,0 +1,8 @@
+# expect-error: invalid proxyProtocolVersion
+[[tunnels]]
+name = "db"
+protocol = "tcp"
+remotePort = 3306
+service = "127.0.0.1:3306"
+[tunnels.transport]
+proxyProtocolVersion = "invalid-version"

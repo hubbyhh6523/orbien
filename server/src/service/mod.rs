@@ -49,7 +49,8 @@ pub struct Service {
 
 impl Service {
     pub fn new(cfg: ServerConfig) -> Result<Self> {
-        let access = Arc::new(RwLock::new(Arc::new(AccessPolicy::from_server_config(&cfg)?)));
+        let (policy, tls_config) = Self::prepare_config(&cfg)?;
+        let access = Arc::new(RwLock::new(Arc::new(policy)));
         let http_gw = if cfg.http_gw_enabled() {
             Some(Arc::new(HttpGw::new(cfg.http_gw_port)))
         } else {
@@ -61,8 +62,6 @@ impl Service {
             None
         };
         let tls = &cfg.transport.tls;
-        let tls_config =
-            transport::new_server_tls_config(&tls.cert_file, &tls.key_file, &tls.trusted_ca_file)?;
         if tls.force {
             tracing::info!("transport.tls.force=true — non-TLS control connections rejected");
         }
@@ -93,10 +92,6 @@ impl Service {
 
         let gw_shutdown = Arc::new(Notify::new());
         let mut set = JoinSet::new();
-        let listen_host = this
-            .cfg
-            .listen_host()
-            .map_err(|e| anyhow!("invalid listen: {e}"))?;
 
         if let Some(ref gw) = this.http_gw {
             let bind = this.cfg.proxy_addr.clone();
@@ -117,9 +112,7 @@ impl Service {
         }
 
         if this.cfg.quic_enabled() {
-            let quic_addr: SocketAddr = format!("{}: {}", listen_host, this.cfg.quic_port)
-                .parse()
-                .map_err(|e| anyhow!("invalid quic bind addr: {e}"))?;
+            let quic_addr = Self::transport_bind_addr(&this.cfg, this.cfg.quic_port)?;
             let endpoint = transport::build_server_endpoint(
                 quic_addr,
                 this.cfg.transport.quic.keepalive(),
@@ -135,9 +128,7 @@ impl Service {
         }
 
         if this.cfg.kcp_enabled() {
-            let kcp_addr: SocketAddr = format!("{}: {}", listen_host, this.cfg.kcp_port)
-                .parse()
-                .map_err(|e| anyhow!("invalid kcp bind addr: {e}"))?;
+            let kcp_addr = Self::transport_bind_addr(&this.cfg, this.cfg.kcp_port)?;
             let listener = transport::bind_kcp_listener(kcp_addr).await?;
             tracing::info!(
                 %kcp_addr,
@@ -186,12 +177,50 @@ impl Service {
         Arc::clone(&*self.access.read().await)
     }
 
+    fn transport_bind_addr(cfg: &ServerConfig, port: u16) -> Result<SocketAddr> {
+        // Parsing only: do not resolve DNS or create an endpoint here.
+        format!("{}:{port}", cfg.listen_host()?)
+            .parse()
+            .map_err(|e| anyhow!("invalid transport bind address: {e}"))
+    }
+
+    fn prepare_config(cfg: &ServerConfig) -> Result<(AccessPolicy, Arc<rustls::ServerConfig>)> {
+        cfg.validate()?;
+        let policy = AccessPolicy::from_server_config(cfg)
+            .map_err(|e| e.context("access policy preflight"))?;
+        let tls = &cfg.transport.tls;
+        let tls_config = transport::new_server_tls_config(
+            &tls.cert_file, &tls.key_file, &tls.trusted_ca_file,
+        ).map_err(|e| e.context("transport.tls preflight"))?;
+        if cfg.quic_enabled() {
+            Self::transport_bind_addr(cfg, cfg.quic_port)?;
+            let mut crypto = (*tls_config).clone();
+            crypto.alpn_protocols = vec![transport::ALPN_ORBIEN.to_vec()];
+            let _ = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+                .map_err(|e| anyhow!("QuicServerConfig: {e}"))?;
+        }
+        if cfg.kcp_enabled() {
+            Self::transport_bind_addr(cfg, cfg.kcp_port)?;
+        }
+        Ok((policy, tls_config))
+    }
+
+    pub fn check_config(cfg: &ServerConfig) -> Result<()> {
+        Self::prepare_config(cfg).map(|_| ())
+    }
+
+    pub async fn reload_config_file(&self, path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
+        // Load/expand/resolve/complete/validate the entire candidate first.
+        let cfg = ServerConfig::load(path)?;
+        self.reload_access_policy(&cfg).await
+    }
+
     pub async fn reload_access_policy(
         &self,
         new_cfg: &ServerConfig,
     ) -> Result<Vec<String>> {
-        let new_policy = AccessPolicy::from_server_config(new_cfg)
-            .map_err(|e| anyhow!("reload: failed to build access policy: {e}"))?;
+        let (new_policy, _) = Self::prepare_config(new_cfg)?;
+        orbien_core::config::print_config_warnings(&new_cfg.risk_warnings());
 
         let mut changed: Vec<String> = Vec::new();
         let old = &self.cfg;

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     #[serde(default = "default_server")]
     pub server: String,
@@ -29,14 +30,21 @@ pub struct ClientConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    #[serde(default = "default_auth_type", rename = "type", alias = "auth_type")]
+    #[serde(
+        default = "default_auth_type",
+        rename = "type",
+        alias = "auth_type",
+        alias = "authType"
+    )]
     pub auth_type: String,
     #[serde(default)]
     pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_protocol")]
     pub protocol: String,
@@ -105,6 +113,7 @@ impl Default for TransportConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTlsConfig {
     #[serde(default = "default_tls_enable")]
     pub enable: bool,
@@ -142,6 +151,7 @@ fn default_tls_enable() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub name: String,
 
@@ -183,8 +193,9 @@ pub struct TunnelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PluginConfig {
-    #[serde(rename = "type", alias = "plugin_type")]
+    #[serde(rename = "type", alias = "plugin_type", alias = "pluginType")]
     pub plugin_type: String,
 
     #[serde(default)]
@@ -207,12 +218,14 @@ pub struct PluginConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PluginRequestHeaders {
     #[serde(default)]
     pub set: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelTransportConfig {
     #[serde(default)]
     pub bandwidth: f64,

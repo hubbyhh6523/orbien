@@ -1,0 +1,5 @@
+# expect-error: unknown field `remotePrt`
+[[tunnels]]
+name = "db"
+protocol = "tcp"
+remotePrt = 3306

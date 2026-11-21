@@ -19,16 +19,31 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
+
+    /// Check a file offline, without starting the runtime or any listeners.
+    #[arg(long, requires = "config")]
+    check_config: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
     let args = Args::parse();
+    if args.check_config
+        && args.config.as_deref().is_none_or(|path| path.trim().is_empty())
+    {
+        anyhow::bail!("--check-config requires a non-empty -c/--config path");
+    }
     let cfg = load_server_config(&args)?;
+    if args.check_config {
+        service::Service::check_config(&cfg)?;
+        orbien_core::config::print_config_warnings(&cfg.risk_warnings());
+        println!("configuration OK");
+        return Ok(());
+    }
+    orbien_core::config::print_config_warnings(&cfg.risk_warnings());
 
     tracing::info!(
         listen = %cfg.listen,
@@ -39,7 +54,9 @@ async fn main() -> Result<()> {
         "starting orbien-server"
     );
 
-    service::Service::new(cfg)?.run().await
+    tokio::runtime::Runtime::new()?.block_on(async move {
+        service::Service::new(cfg)?.run().await
+    })
 }
 
 fn load_server_config(args: &Args) -> Result<ServerConfig> {

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -103,27 +104,30 @@ pub struct ServerConfig {
 /// `PartialEq` is derived so that `reload_access_policy` can compare
 /// the old and new `token_policies` vecs with `!=` (E0369 fix).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TokenPolicy {
     pub token: String,
-    #[serde(default)]
+    #[serde(default, alias = "allowedTunnels")]
     pub allowed_tunnels: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "allowedProtocols")]
     pub allowed_protocols: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "allowedRemotePorts")]
     pub allowed_remote_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_auth_type", rename = "type", alias = "auth_type")]
     pub auth_type: String,
     #[serde(default)]
     pub token: String,
-    #[serde(default)]
+    #[serde(default, alias = "tokenPolicies")]
     pub token_policies: Vec<TokenPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerTransportConfig {
     #[serde(default = "default_tcp_mux", rename = "tcpMux", alias = "tcp_mux")]
     pub tcp_mux: bool,
@@ -162,6 +166,7 @@ impl Default for ServerTransportConfig {
 
 /// Dashboard web server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
     #[serde(default)]
     pub addr: String,
@@ -231,6 +236,7 @@ impl DashboardConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerTlsConfig {
     #[serde(default)]
     pub force: bool,
@@ -250,6 +256,7 @@ fn default_tcp_mux_keepalive() -> i64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuicOptions {
     #[serde(
         default = "default_quic_keepalive",

@@ -12,7 +12,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use orbien_core::config::ServerConfig;
 use orbien_core::VERSION;
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -251,37 +250,14 @@ async fn config_reload(
         });
     }
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Json(ApiResponse {
-                code: 500,
-                msg: format!("cannot read {path}: {e}"),
-                data: ConfigReloadResp { changed: vec![] },
-            });
-        }
-    };
-
-    // Use fully-qualified path to avoid `use toml;` bare import (clippy::single_component_path_imports)
-    let new_cfg: ServerConfig = match toml::de::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            return Json(ApiResponse {
-                code: 422,
-                msg: format!("config parse error: {e}"),
-                data: ConfigReloadResp { changed: vec![] },
-            });
-        }
-    };
-
-    match state.svc.reload_access_policy(&new_cfg).await {
+    match state.svc.reload_config_file(&path).await {
         Ok(changed) => {
             tracing::info!(path = %path, ?changed, "config reloaded via dashboard");
             Json(ApiResponse::ok(ConfigReloadResp { changed }))
         }
         Err(e) => Json(ApiResponse {
-            code: 500,
-            msg: format!("reload failed: {e}"),
+            code: 422,
+            msg: format!("reload failed: {e:#}"),
             data: ConfigReloadResp { changed: vec![] },
         }),
     }

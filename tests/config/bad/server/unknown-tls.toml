@@ -1,0 +1,3 @@
+# expect-error: unknown field `trusted_ca`
+[transport.tls]
+trusted_ca = "ignored.pem"

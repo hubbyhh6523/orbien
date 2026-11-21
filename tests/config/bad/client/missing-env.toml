@@ -1,0 +1,2 @@
+# expect-error: is not set
+server = "{{env.ORBIEN_ISSUE20_MISSING_ENV_7C01}}"

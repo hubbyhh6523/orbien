@@ -11,7 +11,7 @@ listen = "0.0.0.0:9527"
 #allowed_protocols = ["tcp"]
 #allowed_remote_ports = [6050]
 
-#[webServer]
+#[dashboard]
 #addr = "0.0.0.0"
 #port = 8020
 #user = "YOUR_USERNAME"      # Required when port > 0
