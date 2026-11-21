@@ -94,7 +94,7 @@ keyFile = "./certs/portal.key"
 hostHeaderRewrite = "127.0.0.1"
 
 [tunnels.plugin.requestHeaders.set]
-X-Forwarded-Proto = "https"
+# X-Forwarded-Proto is managed by orbien; overriding it is forbidden.
 X-Orbien-Tunnel = "portal"
 
 [[tunnels]]
