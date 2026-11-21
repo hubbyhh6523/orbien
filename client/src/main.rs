@@ -14,10 +14,13 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
+
+    /// Check offline; do not start a runtime, resolve DNS, or contact peers.
+    #[arg(long)]
+    check_config: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
@@ -27,6 +30,12 @@ async fn main() -> Result<()> {
     tracing::info!(config = %config_path.display(), "loading config");
 
     let cfg = orbien_client::ClientConfig::load(&config_path)?;
+    orbien_client::check_config(&cfg)?;
+    orbien_core::config::print_config_warnings(&cfg.risk_warnings());
+    if args.check_config {
+        println!("configuration OK");
+        return Ok(());
+    }
     tracing::info!(
         server = %cfg.server_endpoint(),
         protocol = %cfg.transport.protocol,
@@ -34,5 +43,6 @@ async fn main() -> Result<()> {
         "starting orbien"
     );
 
-    ClientHandle::new().run_foreground(cfg, config_path).await
+    tokio::runtime::Runtime::new()?
+        .block_on(ClientHandle::new().run_foreground(cfg, config_path))
 }
