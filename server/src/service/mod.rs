@@ -14,7 +14,7 @@ use p2p_broker::P2pBroker;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinSet;
@@ -31,7 +31,10 @@ pub(crate) struct OfflineClientRecord {
     client_ip: String,
     version: String,
     tunnel_count: usize,
-    disconnected_at: Instant,
+    /// Wall-clock time, not `Instant`: a 24h TTL needs a timestamp that can
+    /// be 25h old, and `Instant::now() - 25h` panics on a monotonic clock
+    /// that started less than 25h ago (Windows CI).
+    disconnected_at: SystemTime,
 }
 
 /// Offline client records: at most this many, each kept for `OFFLINE_TTL`
@@ -263,8 +266,10 @@ impl Service {
     /// cleanup task.
     pub(crate) async fn record_offline(&self, record: OfflineClientRecord) {
         let mut offline = self.offline_clients.lock().await;
-        let now = Instant::now();
-        offline.retain(|_, r| now.duration_since(r.disconnected_at) < OFFLINE_TTL);
+        let now = SystemTime::now();
+        offline.retain(|_, r| {
+            now.duration_since(r.disconnected_at).unwrap_or(Duration::ZERO) < OFFLINE_TTL
+        });
         if offline.len() >= MAX_OFFLINE_CLIENTS {
             if let Some(oldest) = offline
                 .iter()
@@ -294,7 +299,7 @@ impl Service {
                     client_ip: c.client_ip.clone(),
                     version: c.version.clone(),
                     tunnel_count,
-                    disconnected_at: Instant::now(),
+                    disconnected_at: SystemTime::now(),
                 })
                 .await;
                 c.kick("kicked from dashboard").await;
@@ -368,7 +373,7 @@ mod tests {
             client_ip: "127.0.0.1:1".into(),
             version: "0.2.0".into(),
             tunnel_count: 0,
-            disconnected_at: Instant::now(),
+            disconnected_at: SystemTime::now(),
         }
     }
 
@@ -378,7 +383,7 @@ mod tests {
     async fn offline_records_capped_and_expire() {
         let svc = Service::new(ServerConfig::default()).expect("default config");
         let mut stale = record("stale");
-        stale.disconnected_at = Instant::now() - Duration::from_secs(25 * 3600);
+        stale.disconnected_at = SystemTime::now() - Duration::from_secs(25 * 3600);
         svc.record_offline(stale).await;
         for i in 0..(MAX_OFFLINE_CLIENTS + 1) {
             svc.record_offline(record(&format!("s{i:04}"))).await;

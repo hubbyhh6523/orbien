@@ -10,7 +10,7 @@ use orbien_core::VERSION;
 use rand::RngExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::SystemTime;
 use uuid::Uuid;
 
 /// 32 random bytes, hex-encoded: the per-session secret (#11) that resume
@@ -227,7 +227,7 @@ impl Service {
                 client_ip: control.client_ip.clone(),
                 version: control.version.clone(),
                 tunnel_count,
-                disconnected_at: Instant::now(),
+                disconnected_at: SystemTime::now(),
             })
             .await;
         }
