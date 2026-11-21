@@ -1,5 +1,6 @@
 mod data_pool;
 mod register;
+pub(crate) mod validate;
 
 use crate::access::AccessPolicy;
 use crate::metrics::{MemMetrics, ServerMetrics};
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
@@ -59,7 +60,16 @@ pub struct Control {
     pool_count: usize,
     http_gw: Option<Arc<HttpGw>>,
     https_gw: Option<Arc<HttpsGw>>,
-    access: Arc<AccessPolicy>,
+    /// Live policy reference (#11): registrations read the current policy
+    /// on every call, so a reload applies to existing sessions immediately
+    /// instead of only to sessions logged in after the reload.
+    access: Arc<RwLock<Arc<AccessPolicy>>>,
+    /// Id of the token this session logged in with (SHA-256 hex, #11).
+    /// Never the raw token.
+    token_id: String,
+    /// Hex-encoded 32-byte secret issued at login (#11). Resume and
+    /// data-connection proofs are HMACs keyed by it.
+    session_secret: String,
     pub metrics: Arc<MemMetrics>,
     last_ping_unix: AtomicI64,
     peer_socket_addr: SocketAddr,
@@ -75,7 +85,7 @@ impl Control {
         pool_count: usize,
         http_gw: Option<Arc<HttpGw>>,
         https_gw: Option<Arc<HttpsGw>>,
-        access: Arc<AccessPolicy>,
+        access: Arc<RwLock<Arc<AccessPolicy>>>,
         user: String,
         hostname: String,
         os: String,
@@ -83,6 +93,8 @@ impl Control {
         version: String,
         client_ip: String,
         metrics: Arc<MemMetrics>,
+        token_id: String,
+        session_secret: String,
     ) -> Self {
         let peer_socket_addr = client_ip
             .parse::<SocketAddr>()
@@ -94,7 +106,9 @@ impl Control {
             .unwrap_or_else(|_| SocketAddr::from_str("0.0.0.0:0").unwrap());
 
         let (reader, writer) = tokio::io::split(stream);
-        let (data_tx, data_rx) = mpsc::channel(64);
+        // #11: the data-conn pool holds at most what the server asked the
+        // client for (pool_count), not a hardcoded 64.
+        let (data_tx, data_rx) = mpsc::channel(pool_count.max(1));
 
         Self {
             session_id,
@@ -119,6 +133,8 @@ impl Control {
             http_gw,
             https_gw,
             access,
+            token_id,
+            session_secret,
             metrics,
             last_ping_unix: AtomicI64::new(
                 SystemTime::now()
@@ -135,6 +151,21 @@ impl Control {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Id of the token this session logged in with (#11).
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    /// Hex-encoded session secret issued at login (#11).
+    pub fn session_secret(&self) -> &str {
+        &self.session_secret
+    }
+
+    /// Current access policy (live: reloads apply immediately, #11).
+    pub async fn access_policy(&self) -> Arc<AccessPolicy> {
+        Arc::clone(&*self.access.read().await)
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
@@ -168,6 +199,10 @@ impl Control {
 
     pub async fn tunnel_count(&self) -> usize {
         self.tunnels.lock().await.len()
+    }
+
+    pub async fn has_tunnel(&self, name: &str) -> bool {
+        self.tunnels.lock().await.contains(name)
     }
 
     pub async fn kick_tunnel(&self, name: &str) -> bool {

@@ -22,6 +22,8 @@ use tokio::sync::{Notify, RwLock};
 pub struct HttpTunnel {
     pub name: String,
     pub domains: Vec<String>,
+    session_id: String,
+    generation: u64,
     gw: Arc<HttpGw>,
     closed: AtomicBool,
 }
@@ -36,21 +38,31 @@ impl HttpTunnel {
     ) -> Result<Self> {
         let domains = build_domains(&np.domains, sub_domain_host)?;
         let name = np.tunnel_name.clone();
+        // #11: enforce the session token's allowed_domains on the final
+        // expanded names, before any route is created.
+        control
+            .access_policy()
+            .await
+            .authorize_domains(control.token_id(), &domains, sub_domain_host)?;
         let locations = expand_locations(&np.locations);
         let rewrite = np.host_header_rewrite.clone();
         let basic_auth_user = np.basic_auth_user.clone();
         let basic_auth_password = np.basic_auth_password.clone();
         let route_by_http_user = np.route_by_http_user.clone();
 
-        gw.unregister_tunnel(&name).await;
-
+        // #11: register all routes atomically; a conflict adds nothing
+        // and the previous tunnel of the same name stays in place.
+        let session_id = control.session_id.clone();
+        let mut routes = Vec::with_capacity(domains.len() * locations.len());
         for domain in &domains {
             for location in &locations {
-                gw.register(
-                    domain,
+                routes.push((
+                    domain.clone(),
                     HttpRoute {
                         tunnel_name: name.clone(),
+                        owner_session_id: session_id.clone(),
                         control: Arc::downgrade(&control),
+                        generation: 0,
                         location: location.clone(),
                         host_header_rewrite: rewrite.clone(),
                         basic_auth_user: basic_auth_user.clone(),
@@ -58,10 +70,10 @@ impl HttpTunnel {
                         route_by_http_user: route_by_http_user.clone(),
                         limiter: limiter.clone(),
                     },
-                )
-                .await?;
+                ));
             }
         }
+        let generation = gw.register_all(&session_id, routes).await?;
 
         tracing::info!(
             tunnel = %name,
@@ -75,6 +87,8 @@ impl HttpTunnel {
         Ok(Self {
             name,
             domains,
+            session_id,
+            generation,
             gw,
             closed: AtomicBool::new(false),
         })
@@ -86,7 +100,9 @@ impl HttpTunnel {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            self.gw.unregister_tunnel(&self.name).await;
+            self.gw
+                .unregister_tunnel(&self.session_id, &self.name, self.generation)
+                .await;
         }
     }
 }

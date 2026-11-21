@@ -21,6 +21,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 cat >"$RUN_DIR/server-https.toml" <<EOF
 listen       = "127.0.0.1:$SERVER_PORT"
 httpsGwPort  = $VHOST_PORT
+rootDomain   = "test.local"
 
 [auth]
 type  = "token"
@@ -56,9 +57,11 @@ start_bg "$LOG_DIR/client-https.log" \
 
 # Poll until SNI route registered – nc -z only proves port is open,
 # not that the vhost entry exists; curl validates both.
+# --noproxy: this VM sets an egress proxy and no_proxy does not cover
+# *.test.local; the SNI host must be reached directly on 127.0.0.1.
 end=$((SECONDS + 30))
 while (( SECONDS < end )); do
-  body="$(curl -kfsS \
+  body="$(curl --noproxy '*' -kfsS \
     --resolve "$SNI_DOMAIN:$VHOST_PORT:127.0.0.1" \
     "https://$SNI_DOMAIN:$VHOST_PORT/" 2>/dev/null)" && break
   sleep 0.25
@@ -68,7 +71,7 @@ echo "$body" | grep -Fx 'orbien-https-ok'
 
 # 10 concurrent requests
 for i in $(seq 1 10); do
-  curl -kfsS \
+  curl --noproxy '*' -kfsS \
     --resolve "$SNI_DOMAIN:$VHOST_PORT:127.0.0.1" \
     "https://$SNI_DOMAIN:$VHOST_PORT/" | grep -Fx 'orbien-https-ok'
 done

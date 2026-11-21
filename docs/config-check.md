@@ -40,6 +40,18 @@ policy dimensions, placeholder secrets and disabled dashboard authentication.
 Warnings identify policy indexes/configuration fields, not token/password
 values. Defaults and policy interpretation are not changed by the warnings.
 
+Token policies (`[[auth.token_policies]]`) restrict what each token may do.
+`allowed_domains` applies to `http` and `https` tunnels: exact domain names
+and `*.suffix` patterns, matched against the final expanded domain list, so
+subdomain prefixes under `rootDomain` are covered too. A policy with an empty
+`allowed_domains` allows only names under `rootDomain`; with no policies
+configured at all, a full domain outside `rootDomain` is refused. An invalid
+pattern (bare `*`, `*.`, illegal characters), a duplicate token, or a token
+that is not listed while policies exist, fails the check and the startup.
+Rejected registrations, resume attempts and data connections are logged with
+the token id (first 16 chars of the SHA-256 hex) and the reason, never the
+raw token; client-supplied text in log lines is sanitized and truncated.
+
 Dashboard reload uses the same server loader and offline preflight. Only after
 the entire candidate passes does it replace the access-policy Arc under its
 write lock. Parse, environment, semantic, CIDR and TLS errors return an API

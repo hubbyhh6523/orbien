@@ -8,9 +8,18 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 impl Control {
-    pub async fn push_data_conn(&self, stream: DynStream) {
-        let _ = self.data_tx.send(stream).await;
-        self.data_notify.notify_waiters();
+    /// Queue a data connection. Returns false when the pool is full (or
+    /// the session is gone); the caller then closes the stream instead of
+    /// letting it wait — a full pool must never block the real client's
+    /// data connections (#11). The pool holds at most `pool_count`
+    /// streams, the number the server asked the client for.
+    pub async fn push_data_conn(&self, stream: DynStream) -> bool {
+        if self.data_tx.try_send(stream).is_ok() {
+            self.data_notify.notify_waiters();
+            true
+        } else {
+            false
+        }
     }
 
     async fn try_pop_data(&self) -> Option<DynStream> {

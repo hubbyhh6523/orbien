@@ -153,6 +153,8 @@ struct TrafficQuery {
 
 #[derive(serde::Serialize)]
 struct TokenMetricsItem {
+    /// First 16 chars of the token id (#11). The raw token is never
+    /// returned by this endpoint.
     token: String,
     #[serde(rename = "activeConns")]
     active_conns: usize,
@@ -162,6 +164,8 @@ struct TokenMetricsItem {
     allowed_protocols: Vec<String>,
     #[serde(rename = "allowedRemotePorts")]
     allowed_remote_ports: Vec<u16>,
+    #[serde(rename = "allowedDomains")]
+    allowed_domains: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -313,26 +317,78 @@ async fn system_traffic(
 async fn system_token_metrics(
     State(state): State<Arc<DashState>>,
 ) -> Json<ApiResponse<TokenMetricsResp>> {
-    let policy_map = state.svc.cfg().auth.token_policies.iter().filter(|p| !p.token.trim().is_empty()).map(|p| {
-        (p.token.trim().to_string(), (p.allowed_tunnels.clone(), p.allowed_protocols.clone(), p.allowed_remote_ports.clone()))
-    }).collect::<std::collections::HashMap<_, _>>();
+    // #11: keyed by token id; displayed by the first 16 chars of the id
+    // (short_token_id of the raw token). The raw token never leaves the
+    // server on this endpoint.
+    let policy_map = state
+        .svc
+        .cfg()
+        .auth
+        .token_policies
+        .iter()
+        .filter(|p| !p.token.trim().is_empty())
+        .map(|p| {
+            let raw = p.token.trim();
+            (
+                orbien_core::auth::token_id(raw),
+                (
+                    orbien_core::auth::short_token_id(raw),
+                    p.allowed_tunnels.clone(),
+                    p.allowed_protocols.clone(),
+                    p.allowed_remote_ports.clone(),
+                    p.allowed_domains.clone(),
+                ),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
 
-    let mut tokens = state.svc.metrics().token_conn_snapshot().into_iter().map(|item| {
-        let (allowed_tunnels, allowed_protocols, allowed_remote_ports) = policy_map.get(&item.token).cloned().unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
-        TokenMetricsItem {
-            token: item.token,
-            active_conns: item.active_conns,
+    let mut tokens = state
+        .svc
+        .metrics()
+        .token_conn_snapshot()
+        .into_iter()
+        .map(|item| {
+            let id = orbien_core::auth::token_id(&item.token);
+            let (
+                display,
+                allowed_tunnels,
+                allowed_protocols,
+                allowed_remote_ports,
+                allowed_domains,
+            ) = policy_map.get(&id).cloned().unwrap_or_else(|| {
+                (
+                    orbien_core::auth::short_token_id(&item.token),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            });
+            TokenMetricsItem {
+                token: display,
+                active_conns: item.active_conns,
+                allowed_tunnels,
+                allowed_protocols,
+                allowed_remote_ports,
+                allowed_domains,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (_id, (display, allowed_tunnels, allowed_protocols, allowed_remote_ports, allowed_domains)) in
+        policy_map
+    {
+        if tokens.iter().any(|item| item.token == display) {
+            continue;
+        }
+        tokens.push(TokenMetricsItem {
+            token: display,
+            active_conns: 0,
             allowed_tunnels,
             allowed_protocols,
             allowed_remote_ports,
-        }
-    }).collect::<Vec<_>>();
-
-    for (token, (allowed_tunnels, allowed_protocols, allowed_remote_ports)) in policy_map {
-        if tokens.iter().any(|item| item.token == token) {
-            continue;
-        }
-        tokens.push(TokenMetricsItem { token, active_conns: 0, allowed_tunnels, allowed_protocols, allowed_remote_ports });
+            allowed_domains,
+        });
     }
 
     tokens.sort_by(|a, b| a.token.cmp(&b.token));

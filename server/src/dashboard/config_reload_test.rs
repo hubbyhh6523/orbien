@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
+use orbien_core::auth::token_id;
 use orbien_core::config::{DashboardConfig, ServerConfig};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -80,8 +81,8 @@ async fn assert_unchanged(state: &Arc<DashState>, text: &str, reason: &str) {
     let after = state.svc.access_policy().await;
     assert!(Arc::ptr_eq(&before, &after));
     assert_eq!(config_before, serde_json::to_value(state.svc.cfg()).unwrap());
-    assert!(after.authorize_proxy("stable-token", "db", "tcp", Some(3306)).is_ok());
-    assert!(after.authorize_proxy("replacement-token", "db", "tcp", Some(5432)).is_err());
+    assert!(after.authorize_proxy(&token_id("stable-token"), "db", "tcp", Some(3306)).is_ok());
+    assert!(after.authorize_proxy(&token_id("replacement-token"), "db", "tcp", Some(5432)).is_err());
 }
 
 #[tokio::test]
@@ -104,6 +105,8 @@ async fn reload_api_semantic_policy_and_tls_errors_are_atomic() {
         ("[dashboard]\nport = 8020", "dashboard.user and dashboard.password"),
         ("denySrcCidrs = ['10.0.0.0/99']", "access policy preflight"),
         ("[transport.tls]\ncertFile = 'missing-cert.pem'\nkeyFile = 'missing-key.pem'", "transport.tls preflight"),
+        ("[[auth.token_policies]]\ntoken = 'x'\nallowed_domains = ['bad_*.com']", "invalid allowed_domains pattern"),
+        ("[[auth.token_policies]]\ntoken = 'dup'\n[[auth.token_policies]]\ntoken = 'dup'", "duplicate token in token_policies"),
     ] {
         assert_unchanged(&state, text, reason).await;
     }
@@ -157,8 +160,8 @@ allowed_remote_ports = [5432]
     let result = reload(Arc::clone(&state), None).await;
     assert_eq!(result["code"], 200, "{result}");
     let policy = state.svc.access_policy().await;
-    assert!(policy.authorize_proxy("next-token", "db", "tcp", Some(5432)).is_ok());
-    assert!(policy.authorize_proxy("stable-token", "db", "tcp", Some(3306)).is_err());
+    assert!(policy.authorize_proxy(&token_id("next-token"), "db", "tcp", Some(5432)).is_ok());
+    assert!(policy.authorize_proxy(&token_id("stable-token"), "db", "tcp", Some(3306)).is_err());
 }
 
 #[tokio::test]
@@ -169,4 +172,25 @@ async fn direct_reload_cannot_bypass_the_shared_preflight() {
     candidate.dashboard.port = 8020;
     assert!(state.svc.reload_access_policy(&candidate).await.is_err());
     assert!(Arc::ptr_eq(&before, &state.svc.access_policy().await));
+}
+
+#[tokio::test]
+async fn reload_api_allowed_domains_accepted() {
+    let state = state();
+    let file = ConfigFile::new(
+        "[[auth.token_policies]]\ntoken = 'dom-token'\n\
+         allowed_domains = ['app.example.com', '*.example.org']\n",
+    );
+    let result = reload(Arc::clone(&state), Some(&file.0)).await;
+    assert_eq!(result["code"], 200, "{result}");
+    let policy = state.svc.access_policy().await;
+    assert!(policy
+        .authorize_domains(&token_id("dom-token"), &["app.example.com".to_string()], "other.test")
+        .is_ok());
+    assert!(policy
+        .authorize_domains(&token_id("dom-token"), &["a.example.org".to_string()], "other.test")
+        .is_ok());
+    assert!(policy
+        .authorize_domains(&token_id("dom-token"), &["evil.com".to_string()], "other.test")
+        .is_err());
 }

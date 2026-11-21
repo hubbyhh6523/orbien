@@ -77,7 +77,7 @@ impl Service {
                 version: rec.version.clone(),
                 tunnel_count: rec.tunnel_count,
                 active_connections: 0,
-                connected_secs: rec.disconnected_at.elapsed().as_secs(),
+                connected_secs: rec.disconnected_at.elapsed().unwrap_or_default().as_secs(),
                 status: "offline".into(),
             });
         }

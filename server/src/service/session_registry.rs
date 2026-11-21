@@ -1,15 +1,24 @@
 use super::{OfflineClientRecord, Service};
-use crate::control::{Control, P2pHandler};
+use crate::control::{validate, Control, P2pHandler};
 use crate::metrics::ServerMetrics;
+use crate::sanitize::sanitize_for_logging;
 use anyhow::{anyhow, Result};
 use orbien_core::auth;
 use orbien_core::msg::{self, Login, LoginResp, Message, NewDataConn};
 use orbien_core::transport::DynStream;
 use orbien_core::VERSION;
+use rand::RngExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::SystemTime;
 use uuid::Uuid;
+
+/// 32 random bytes, hex-encoded: the per-session secret (#11) that resume
+/// and data-connection proofs are HMACed with.
+fn new_session_secret() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 impl Service {
     pub(crate) async fn register_control(
@@ -18,7 +27,23 @@ impl Service {
         login: Login,
         peer: SocketAddr,
     ) -> Result<()> {
-        if !auth::verify_login(&self.cfg.auth.token, &login.auth_digest, login.timestamp) {
+        // #11: match the digest against the global token AND every policy
+        // token, and remember which one matched (as a token id, never the
+        // raw token). A policy token that is not the global token could
+        // not log in at all before this.
+        let policy_tokens: Vec<&str> = self
+            .cfg
+            .auth
+            .token_policies
+            .iter()
+            .map(|p| p.token.as_str())
+            .collect();
+        let Some(token_id) = auth::match_token_id(
+            &self.cfg.auth.token,
+            &policy_tokens,
+            &login.auth_digest,
+            login.timestamp,
+        ) else {
             let mut stream = stream;
             let _ = msg::write_msg(
                 &mut stream,
@@ -26,17 +51,66 @@ impl Service {
                     version: VERSION.into(),
                     session_id: String::new(),
                     error: "authorization failed".into(),
+                    resume_token: String::new(),
                 }),
             )
             .await;
             return Err(anyhow!("authorization failed"));
+        };
+
+        // #11: reject Login strings outside the allowed length or
+        // character set before anything is logged or stored from them.
+        if let Err(e) = validate::validate_login(&login) {
+            let mut stream = stream;
+            let _ = msg::write_msg(
+                &mut stream,
+                &Message::LoginResp(LoginResp {
+                    version: VERSION.into(),
+                    session_id: String::new(),
+                    error: e.clone(),
+                    resume_token: String::new(),
+                }),
+            )
+            .await;
+            return Err(anyhow!("{e}"));
         }
 
-        let session_id = if login.session_id.is_empty() {
+        // #11: session identity. A login that claims a live session id
+        // must prove possession of that session's secret; without valid
+        // proof the old session is left alone and the caller gets a new
+        // id (even from the same address). An unknown id — e.g. after a
+        // server restart, when the secret is gone — also gets a new id.
+        // A fresh secret is issued on every login.
+        let requested = login.session_id.clone();
+        let session_id = if requested.is_empty() {
             short_session_id()
         } else {
-            login.session_id.clone()
+            match self.control_by_session(&requested).await {
+                Some(old)
+                    if !login.resume_proof.is_empty()
+                        && auth::verify_session_proof(
+                            old.session_secret(),
+                            "resume",
+                            &requested,
+                            &login.resume_proof,
+                            login.timestamp,
+                        ) =>
+                {
+                    requested
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        token_id = %token_id.get(..16).unwrap_or(&token_id),
+                        session_id = %requested,
+                        %peer,
+                        "login claimed a live session id without valid resume proof; issuing a new id"
+                    );
+                    short_session_id()
+                }
+                None => short_session_id(),
+            }
         };
+        let session_secret = new_session_secret();
 
         let mut stream = stream;
         msg::write_msg(
@@ -45,18 +119,23 @@ impl Service {
                 version: VERSION.into(),
                 session_id: session_id.clone(),
                 error: String::new(),
+                resume_token: session_secret.clone(),
             }),
         )
         .await?;
 
-        tracing::info!(%session_id, %peer, pool = login.pool_count, "client logged in");
+        tracing::info!(
+            %session_id,
+            %peer,
+            pool = login.pool_count,
+            token_id = %token_id.get(..16).unwrap_or(&token_id),
+            "client logged in"
+        );
 
         let max_pool = self.cfg.transport.max_conn_pool.max(0) as usize;
         let pool_count = (login.pool_count.max(0) as usize).min(max_pool);
 
         let client_ip = peer.to_string();
-
-        let access_snapshot = self.access.read().await.clone();
 
         let mut control = Control::new(
             session_id.clone(),
@@ -65,7 +144,7 @@ impl Service {
             pool_count,
             self.http_gw.clone(),
             self.https_gw.clone(),
-            access_snapshot,
+            Arc::clone(&self.access),
             login.user.clone(),
             login.hostname.clone(),
             login.os.clone(),
@@ -73,6 +152,8 @@ impl Service {
             login.version.clone(),
             client_ip,
             Arc::clone(&self.metrics),
+            token_id,
+            session_secret,
         );
 
         // Wire up the P2P broker dispatch hook so the control loop can forward
@@ -120,7 +201,6 @@ impl Service {
         self.metrics.new_client(&session_id);
 
         let controls = Arc::clone(&self.controls);
-        let offline_clients = Arc::clone(&self.offline_clients);
         let metrics = Arc::clone(&self.metrics);
         let rid = session_id.clone();
         let result = Arc::clone(&control).run().await;
@@ -138,21 +218,18 @@ impl Service {
         }
         if !map.contains_key(&rid) {
             drop(map);
-            let mut offline = offline_clients.lock().await;
-            offline.insert(
-                rid.clone(),
-                OfflineClientRecord {
-                    session_id: rid,
-                    user: control.user.clone(),
-                    hostname: control.hostname.clone(),
-                    os: control.os.clone(),
-                    arch: control.arch.clone(),
-                    client_ip: control.client_ip.clone(),
-                    version: control.version.clone(),
-                    tunnel_count,
-                    disconnected_at: Instant::now(),
-                },
-            );
+            self.record_offline(OfflineClientRecord {
+                session_id: rid,
+                user: control.user.clone(),
+                hostname: control.hostname.clone(),
+                os: control.os.clone(),
+                arch: control.arch.clone(),
+                client_ip: control.client_ip.clone(),
+                version: control.version.clone(),
+                tunnel_count,
+                disconnected_at: SystemTime::now(),
+            })
+            .await;
         }
 
         result
@@ -166,26 +243,56 @@ impl Service {
         if nw.session_id.trim().is_empty() {
             return Err(anyhow!("empty session_id for data conn"));
         }
-        if !auth::verify_auth_digest(&self.cfg.auth.token, &nw.auth_digest, nw.timestamp) {
-            return Err(anyhow!(
-                "data conn auth failed for session_id={}",
-                nw.session_id
-            ));
-        }
         let control = {
             let map = self.controls.lock().await;
             map.get(&nw.session_id).cloned()
         };
-        match control {
-            Some(c) => {
-                c.push_data_conn(stream).await;
-                Ok(())
-            }
-            None => Err(anyhow!(
+        let Some(control) = control else {
+            return Err(anyhow!(
                 "unknown session_id for data conn: {}",
                 nw.session_id
-            )),
+            ));
+        };
+        // #11, hard cut: a data connection must prove possession of the
+        // session secret (purpose "data-conn"). No legacy fallback — a
+        // stream that fails the proof is closed here and never queued,
+        // so it can neither read visitor traffic nor fill the pool.
+        if nw.proof.is_empty()
+            || !auth::verify_session_proof(
+                control.session_secret(),
+                "data-conn",
+                &nw.session_id,
+                &nw.proof,
+                nw.timestamp,
+            )
+        {
+            let token_id = control.token_id();
+            tracing::warn!(
+                token_id = %token_id.get(..16).unwrap_or(token_id),
+                session_id = %sanitize_for_logging(&nw.session_id),
+                "data conn proof rejected"
+            );
+            return Err(anyhow!(
+                "data conn proof failed for session_id={}",
+                nw.session_id
+            ));
         }
+        // #11: a full pool refuses the stream instead of queueing it, so
+        // a flood of forged connections cannot block the real client's
+        // data connections. The rejected stream is dropped (closed) here.
+        if !control.push_data_conn(stream).await {
+            let token_id = control.token_id();
+            tracing::warn!(
+                token_id = %token_id.get(..16).unwrap_or(token_id),
+                session_id = %sanitize_for_logging(&nw.session_id),
+                "data conn pool full; closing stream"
+            );
+            return Err(anyhow!(
+                "data conn pool full for session_id={}",
+                nw.session_id
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -103,6 +103,10 @@ impl TunnelManager {
     pub fn len(&self) -> usize {
         self.tunnels.len()
     }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.tunnels.contains_key(name)
+    }
 }
 
 pub fn format_local_addr(ip: &str, port: i32) -> String {

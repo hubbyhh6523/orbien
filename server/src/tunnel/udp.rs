@@ -1,3 +1,4 @@
+use crate::access::AccessPolicy;
 use crate::control::Control;
 use crate::metrics::{MemMetrics, ServerMetrics};
 use anyhow::Result;
@@ -20,10 +21,18 @@ pub struct UdpTunnel {
     notify: Arc<Notify>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 
+    /// Access policy, kept for the source checks of #15 (no behavior
+    /// change in #11; stored so the tunnel does not need re-plumbing).
+    _access: Arc<AccessPolicy>,
+
     _udp: Arc<UdpSocket>,
 }
 
 impl UdpTunnel {
+    // #11: 8 args — `access` is the policy for the #15 source checks.
+    // Kept explicit (rather than re-reading it off `control`) so the
+    // tunnel's policy dependency is visible at the call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         name: String,
         bind_addr: String,
@@ -32,6 +41,7 @@ impl UdpTunnel {
         limiter: Option<Arc<BandwidthLimiter>>,
         packet_size: usize,
         max_connections: usize,
+        access: Arc<AccessPolicy>,
     ) -> Result<Self> {
         let addr = format!("{bind_addr}:{remote_port}");
         let udp = Arc::new(UdpSocket::bind(&addr).await?);
@@ -82,6 +92,7 @@ impl UdpTunnel {
             closed,
             notify,
             tasks: Mutex::new(tasks),
+            _access: access,
             _udp: udp,
         })
     }

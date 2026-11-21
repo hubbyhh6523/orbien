@@ -14,7 +14,7 @@ use p2p_broker::P2pBroker;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinSet;
@@ -22,7 +22,7 @@ use tokio::task::JoinSet;
 #[allow(unused_imports)]
 pub use dashboard_view::DashboardSnapshot;
 
-struct OfflineClientRecord {
+pub(crate) struct OfflineClientRecord {
     session_id: String,
     user: String,
     hostname: String,
@@ -31,8 +31,16 @@ struct OfflineClientRecord {
     client_ip: String,
     version: String,
     tunnel_count: usize,
-    disconnected_at: Instant,
+    /// Wall-clock time, not `Instant`: a 24h TTL needs a timestamp that can
+    /// be 25h old, and `Instant::now() - 25h` panics on a monotonic clock
+    /// that started less than 25h ago (Windows CI).
+    disconnected_at: SystemTime,
 }
+
+/// Offline client records: at most this many, each kept for `OFFLINE_TTL`
+/// (#11). Cleanup happens on insert; there is no background task.
+const MAX_OFFLINE_CLIENTS: usize = 1000;
+const OFFLINE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 pub struct Service {
     cfg: ServerConfig,
@@ -252,6 +260,28 @@ impl Service {
         Ok(changed)
     }
 
+    /// Offline client records are capped and expire (#11): at most
+    /// `MAX_OFFLINE_CLIENTS` records, each kept for `OFFLINE_TTL`. Expired
+    /// and oldest records are dropped on insert; there is no background
+    /// cleanup task.
+    pub(crate) async fn record_offline(&self, record: OfflineClientRecord) {
+        let mut offline = self.offline_clients.lock().await;
+        let now = SystemTime::now();
+        offline.retain(|_, r| {
+            now.duration_since(r.disconnected_at).unwrap_or(Duration::ZERO) < OFFLINE_TTL
+        });
+        if offline.len() >= MAX_OFFLINE_CLIENTS {
+            if let Some(oldest) = offline
+                .iter()
+                .min_by_key(|(_, r)| r.disconnected_at)
+                .map(|(k, _)| k.clone())
+            {
+                offline.remove(&oldest);
+            }
+        }
+        offline.insert(record.session_id.clone(), record);
+    }
+
     pub async fn kick_client(&self, session_id: &str) -> Result<()> {
         let control = {
             let mut map = self.controls.lock().await;
@@ -260,23 +290,18 @@ impl Service {
         match control {
             Some(c) => {
                 let tunnel_count = c.tunnel_count().await;
-                {
-                    let mut offline = self.offline_clients.lock().await;
-                    offline.insert(
-                        session_id.to_string(),
-                        OfflineClientRecord {
-                            session_id: session_id.to_string(),
-                            user: c.user.clone(),
-                            hostname: c.hostname.clone(),
-                            os: c.os.clone(),
-                            arch: c.arch.clone(),
-                            client_ip: c.client_ip.clone(),
-                            version: c.version.clone(),
-                            tunnel_count,
-                            disconnected_at: Instant::now(),
-                        },
-                    );
-                }
+                self.record_offline(OfflineClientRecord {
+                    session_id: session_id.to_string(),
+                    user: c.user.clone(),
+                    hostname: c.hostname.clone(),
+                    os: c.os.clone(),
+                    arch: c.arch.clone(),
+                    client_ip: c.client_ip.clone(),
+                    version: c.version.clone(),
+                    tunnel_count,
+                    disconnected_at: SystemTime::now(),
+                })
+                .await;
                 c.kick("kicked from dashboard").await;
                 Ok(())
             }
@@ -331,5 +356,45 @@ impl Service {
         session_id: &str,
     ) -> anyhow::Result<()> {
         self.p2p.handle_addr(addr_msg, session_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: &str) -> OfflineClientRecord {
+        OfflineClientRecord {
+            session_id: id.into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            client_ip: "127.0.0.1:1".into(),
+            version: "0.2.0".into(),
+            tunnel_count: 0,
+            disconnected_at: SystemTime::now(),
+        }
+    }
+
+    /// Step 5: offline records are capped at 1000 (oldest dropped) and
+    /// records older than 24h expire on insert.
+    #[tokio::test]
+    async fn offline_records_capped_and_expire() {
+        let svc = Service::new(ServerConfig::default()).expect("default config");
+        let mut stale = record("stale");
+        stale.disconnected_at = SystemTime::now() - Duration::from_secs(25 * 3600);
+        svc.record_offline(stale).await;
+        for i in 0..(MAX_OFFLINE_CLIENTS + 1) {
+            svc.record_offline(record(&format!("s{i:04}"))).await;
+        }
+        let offline = svc.offline_clients.lock().await;
+        assert_eq!(offline.len(), MAX_OFFLINE_CLIENTS);
+        assert!(!offline.contains_key("stale"), "expired record must be gone");
+        assert!(
+            !offline.contains_key("s0000"),
+            "oldest record must be dropped at the cap"
+        );
+        assert!(offline.contains_key(&format!("s{MAX_OFFLINE_CLIENTS:04}")));
     }
 }

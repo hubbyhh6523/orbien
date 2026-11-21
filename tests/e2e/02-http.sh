@@ -11,6 +11,7 @@ UPSTREAM_PORT=49700
 cat >"$RUN_DIR/server-http.toml" <<EOF
 listen      = "127.0.0.1:$SERVER_PORT"
 httpGwPort  = $VHOST_PORT
+rootDomain  = "test.local"
 
 [auth]
 type  = "token"

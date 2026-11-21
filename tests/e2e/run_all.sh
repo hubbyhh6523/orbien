@@ -18,6 +18,7 @@ steps=(
   04-udp.sh
   05-token.sh
   06-dashboard.sh
+  07-token-policy.sh
 )
 
 for step in "${steps[@]}"; do
