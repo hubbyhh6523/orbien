@@ -154,6 +154,7 @@ mod tests {
             timestamp: 1_700_000_000,
             session_id: "session-1".into(),
             pool_count: 4,
+            resume_proof: String::new(),
         }))
         .await;
     }

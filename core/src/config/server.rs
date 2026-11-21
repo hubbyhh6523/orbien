@@ -113,6 +113,11 @@ pub struct TokenPolicy {
     pub allowed_protocols: Vec<String>,
     #[serde(default, alias = "allowedRemotePorts")]
     pub allowed_remote_ports: Vec<u16>,
+    /// Domains this token may register http/https tunnels for: exact
+    /// names (`app.example.com`) and suffix patterns (`*.example.com`).
+    /// Empty means only names under the server `rootDomain` (#11).
+    #[serde(default, alias = "allowedDomains")]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

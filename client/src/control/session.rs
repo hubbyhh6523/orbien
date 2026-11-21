@@ -40,6 +40,9 @@ type OnTunnelRemote = Arc<dyn Fn(String, String) + Send + Sync>;
 pub struct Control {
     cfg: ClientConfig,
     session_id: String,
+    /// Hex-encoded session secret issued by the server at login (#11);
+    /// data-connection proofs are HMACs keyed by it.
+    session_secret: String,
     reader: Mutex<CtrlRead>,
     writer: Mutex<CtrlWrite>,
     tunnels: TunnelManager,
@@ -71,6 +74,20 @@ impl Control {
 
         let timestamp = now_secs();
         let auth_digest = auth::compute_auth_digest(&cfg.auth.token, timestamp);
+        // #11: prove possession of the previous session's secret when
+        // resuming its id. Without a stored secret (or with a wrong one)
+        // the server issues a new id instead of taking over the old one.
+        let resume_secret = session_id::load_resume_secret(config_path);
+        let resume_proof = if previous_session_id.is_empty() || resume_secret.is_empty() {
+            String::new()
+        } else {
+            auth::compute_session_proof(
+                &resume_secret,
+                "resume",
+                &previous_session_id,
+                timestamp,
+            )
+        };
         let login = Login {
             version: VERSION.into(),
             hostname: hostname(),
@@ -81,6 +98,7 @@ impl Control {
             timestamp,
             session_id: previous_session_id,
             pool_count: cfg.transport.pool_count,
+            resume_proof,
         };
         tracing::info!(
             hostname = %login.hostname,
@@ -116,11 +134,20 @@ impl Control {
         if let Err(e) = session_id::save(config_path, &resp.session_id) {
             tracing::warn!(error = %e, "failed to persist session_id");
         }
+        // #11: store the new session secret for resume and data-conn
+        // proofs. An old server leaves it empty; data conns then carry
+        // no proof and are refused by a new server (hard cut).
+        if !resp.resume_token.is_empty() {
+            if let Err(e) = session_id::save_resume_secret(config_path, &resp.resume_token) {
+                tracing::warn!(error = %e, "failed to persist resume secret");
+            }
+        }
 
         let (reader, writer) = tokio::io::split(stream);
         let ctl = Arc::new(Control {
             cfg: cfg.clone(),
             session_id: resp.session_id.clone(),
+            session_secret: resp.resume_token.clone(),
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             tunnels: TunnelManager::from_config(cfg)?,
@@ -427,12 +454,26 @@ impl Control {
         let mut data = self.connector.open().await?;
 
         let timestamp = now_secs();
+        // #11: prove this data connection belongs to this session. The
+        // auth_digest is kept as a transition field; the proof is what
+        // the server verifies.
+        let proof = if self.session_secret.is_empty() {
+            String::new()
+        } else {
+            auth::compute_session_proof(
+                &self.session_secret,
+                "data-conn",
+                &self.session_id,
+                timestamp,
+            )
+        };
         msg::write_msg(
             &mut data,
             &Message::NewDataConn(NewDataConn {
                 session_id: self.session_id.clone(),
                 auth_digest: auth::compute_auth_digest(&self.cfg.auth.token, timestamp),
                 timestamp,
+                proof,
             }),
         )
         .await?;

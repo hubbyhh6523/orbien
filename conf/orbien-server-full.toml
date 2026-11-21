@@ -27,6 +27,7 @@ token = "YOUR_TOKEN"
 # allowed_tunnels    = ["ssh", "web"]   # leave empty = no restriction
 # allowed_protocols  = ["tcp", "http"]  # leave empty = no restriction
 # allowed_remote_ports = [9000, 9001]   # leave empty = no restriction
+# allowed_domains    = ["app.example.com", "*.example.org"]  # leave empty = only names under rootDomain
 
 [transport]
 tcpMux = true

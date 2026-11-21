@@ -2,6 +2,7 @@ mod access;
 mod control;
 mod dashboard;
 mod metrics;
+mod sanitize;
 mod service;
 mod tunnel;
 

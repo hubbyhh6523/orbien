@@ -1,0 +1,5 @@
+# expect-error: duplicate token in token_policies
+[[auth.token_policies]]
+token = "tok-a"
+[[auth.token_policies]]
+token = "tok-a"

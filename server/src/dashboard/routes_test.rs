@@ -301,6 +301,53 @@ mod tests {
         assert!(json["data"]["tokens"].is_array());
     }
 
+    /// #11: the tokens endpoint must never expose a raw token — only the
+    /// first 16 chars of its id, plus the policy dimensions.
+    #[tokio::test]
+    async fn system_tokens_never_exposes_raw_tokens() {
+        use orbien_core::config::TokenPolicy;
+        let mut cfg = ServerConfig::default();
+        cfg.auth.token_policies = vec![TokenPolicy {
+            token: "policy-secret-1".into(),
+            allowed_tunnels: vec!["web".into()],
+            allowed_protocols: vec!["http".into()],
+            allowed_remote_ports: vec![],
+            allowed_domains: vec!["app.example.com".into()],
+        }];
+        let svc = Arc::new(Service::new(cfg).expect("Service::new"));
+        let state = Arc::new(DashState {
+            svc,
+            cfg: DashboardConfig {
+                addr: "127.0.0.1".into(),
+                port: 0,
+                user: String::new(),
+                password: "x".into(),
+                disable_auth: true,
+                ..Default::default()
+            },
+            auth: Some(Arc::new(AuthState::session_only())),
+        });
+        let req = Request::get("/api/v1/system/tokens")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = call(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("policy-secret-1"),
+            "raw token leaked: {rendered}"
+        );
+        let id = orbien_core::auth::token_id("policy-secret-1");
+        assert!(
+            rendered.contains(&id[..16]),
+            "token id prefix missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("app.example.com"),
+            "allowed_domains missing: {rendered}"
+        );
+    }
+
     // ── /metrics (Prometheus) ─────────────────────────────────────────────────
 
     #[tokio::test]

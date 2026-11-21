@@ -95,6 +95,20 @@ fn token_policy_accepts_both_key_styles() {
 }
 
 #[test]
+fn token_policy_allowed_domains_alias() {
+    for key in ["allowed_domains", "allowedDomains"] {
+        let text = format!(
+            "[[auth.token_policies]]\ntoken = 'test'\n{key} = ['example.com', '*.example.org']"
+        );
+        let cfg: ServerConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            cfg.auth.token_policies[0].allowed_domains,
+            vec!["example.com".to_owned(), "*.example.org".to_owned()]
+        );
+    }
+}
+
+#[test]
 fn duplicate_policy_aliases_are_rejected() {
     assert!(toml::from_str::<ServerConfig>(
         "[auth]\ntoken_policies = []\ntokenPolicies = []"

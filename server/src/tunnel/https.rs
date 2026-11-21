@@ -7,7 +7,7 @@ use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use orbien_core::msg::NewTunnel;
 use orbien_core::tls::{peek_client_hello_sni, PrefixedStream};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -15,12 +15,17 @@ use tokio::sync::{Mutex, Notify, RwLock};
 #[derive(Clone)]
 pub struct HttpsRoute {
     pub tunnel_name: String,
+    /// Session that owns this route; see `HttpRoute::owner_session_id` (#11).
+    pub owner_session_id: String,
     pub control: Weak<Control>,
+    /// Registration generation, stamped by `HttpsGw::register_all` (#11).
+    pub generation: u64,
     pub limiter: Option<Arc<BandwidthLimiter>>,
 }
 
 pub struct HttpsGw {
     routes: Mutex<HashMap<String, HttpsRoute>>,
+    next_generation: AtomicU64,
     pub listen_port: u16,
 }
 
@@ -28,29 +33,64 @@ impl HttpsGw {
     pub fn new(listen_port: u16) -> Self {
         Self {
             routes: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
             listen_port,
         }
     }
 
-    pub async fn register(&self, domain: &str, route: HttpsRoute) -> Result<()> {
-        let key = normalize_host(domain);
-        if key.is_empty() {
-            return Err(anyhow!("empty https domain"));
+    /// Validate every (domain, route) pair first, then add all of them
+    /// under one lock; any conflict adds nothing. Returns the generation
+    /// stamped on the new routes (#11). A domain is owned by the first
+    /// live session that registers it; a route whose owner is gone is
+    /// evicted and does not block.
+    pub async fn register_all(
+        &self,
+        session_id: &str,
+        routes: Vec<(String, HttpsRoute)>,
+    ) -> Result<u64> {
+        let mut pending: Vec<(String, HttpsRoute)> = Vec::with_capacity(routes.len());
+        for (domain, route) in routes {
+            let key = normalize_host(&domain);
+            if key.is_empty() {
+                return Err(anyhow!("empty https domain"));
+            }
+            pending.push((key, route));
         }
+        if pending.is_empty() {
+            return Err(anyhow!("no https routes to register"));
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let mut map = self.routes.lock().await;
-        if let Some(existing) = map.get(&key) {
-            if existing.tunnel_name != route.tunnel_name {
-                return Err(anyhow!("router config conflict: domain={key} (https)"));
+        for (key, route) in &pending {
+            if let Some(existing) = map.get(key) {
+                if existing.control.upgrade().is_none() {
+                    continue;
+                }
+                if existing.owner_session_id != session_id {
+                    return Err(anyhow!("https domain {key} is owned by another session"));
+                }
+                if existing.tunnel_name != route.tunnel_name {
+                    return Err(anyhow!("router config conflict: domain={key} (https)"));
+                }
             }
         }
-        map.insert(key.clone(), route);
-        tracing::info!(domain = %key, "https route registered");
-        Ok(())
+        for (key, mut route) in pending {
+            route.generation = generation;
+            map.insert(key.clone(), route);
+            tracing::info!(domain = %key, "https route registered");
+        }
+        Ok(generation)
     }
 
-    pub async fn unregister_tunnel(&self, tunnel_name: &str) {
+    /// Remove only the routes of one registration generation of one
+    /// session's tunnel (#11).
+    pub async fn unregister_tunnel(&self, session_id: &str, tunnel_name: &str, generation: u64) {
         let mut map = self.routes.lock().await;
-        map.retain(|_, r| r.tunnel_name != tunnel_name);
+        map.retain(|_, r| {
+            !(r.owner_session_id == session_id
+                && r.tunnel_name == tunnel_name
+                && r.generation == generation)
+        });
     }
 
     pub async fn lookup(&self, sni: &str) -> Option<HttpsRoute> {
@@ -63,6 +103,8 @@ impl HttpsGw {
 pub struct HttpsTunnel {
     pub name: String,
     pub domains: Vec<String>,
+    session_id: String,
+    generation: u64,
     gw: Arc<HttpsGw>,
     closed: AtomicBool,
 }
@@ -77,20 +119,35 @@ impl HttpsTunnel {
     ) -> Result<Self> {
         let domains = build_domains(&np.domains, sub_domain_host)?;
         let name = np.tunnel_name.clone();
+        // #11: enforce the session token's allowed_domains on the final
+        // expanded names, before any route is created.
+        control
+            .access_policy()
+            .await
+            .authorize_domains(control.token_id(), &domains, sub_domain_host)?;
 
-        gw.unregister_tunnel(&name).await;
-
-        for domain in &domains {
-            gw.register(
-                domain,
-                HttpsRoute {
-                    tunnel_name: name.clone(),
-                    control: Arc::downgrade(&control),
-                    limiter: limiter.clone(),
-                },
+        // #11: register all routes atomically; a conflict adds nothing
+        // and the previous tunnel of the same name stays in place.
+        let generation = gw
+            .register_all(
+                &control.session_id,
+                domains
+                    .iter()
+                    .map(|domain| {
+                        (
+                            domain.clone(),
+                            HttpsRoute {
+                                tunnel_name: name.clone(),
+                                owner_session_id: control.session_id.clone(),
+                                control: Arc::downgrade(&control),
+                                generation: 0,
+                                limiter: limiter.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
             )
             .await?;
-        }
 
         tracing::info!(
             tunnel = %name,
@@ -101,6 +158,8 @@ impl HttpsTunnel {
         Ok(Self {
             name,
             domains,
+            session_id: control.session_id.clone(),
+            generation,
             gw,
             closed: AtomicBool::new(false),
         })
@@ -112,7 +171,9 @@ impl HttpsTunnel {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            self.gw.unregister_tunnel(&self.name).await;
+            self.gw
+                .unregister_tunnel(&self.session_id, &self.name, self.generation)
+                .await;
         }
     }
 }

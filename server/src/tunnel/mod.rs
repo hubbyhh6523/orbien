@@ -1,4 +1,6 @@
 mod gw;
+#[cfg(test)]
+mod gw_test;
 mod http;
 mod https;
 mod manager;

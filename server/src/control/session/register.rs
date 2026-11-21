@@ -1,5 +1,6 @@
 use super::Control;
 use crate::metrics::ServerMetrics;
+use crate::sanitize::sanitize_for_logging;
 use crate::tunnel::{
     format_local_addr, HttpTunnel, HttpsTunnel, RegisteredTunnel, TcpTunnel, UdpTunnel,
 };
@@ -20,11 +21,22 @@ impl Control {
                 remote_addr,
                 error: String::new(),
             },
-            Err(e) => NewTunnelResp {
-                tunnel_name: np.tunnel_name.clone(),
-                remote_addr: String::new(),
-                error: e.to_string(),
-            },
+            Err(e) => {
+                // #11: rejected registrations are logged with the token id
+                // and the reason; client-supplied text is sanitized first.
+                let token_id = self.token_id();
+                tracing::warn!(
+                    token_id = %token_id.get(..16).unwrap_or(token_id),
+                    tunnel = %sanitize_for_logging(&np.tunnel_name),
+                    error = %sanitize_for_logging(&e.to_string()),
+                    "tunnel registration rejected"
+                );
+                NewTunnelResp {
+                    tunnel_name: np.tunnel_name.clone(),
+                    remote_addr: String::new(),
+                    error: e.to_string(),
+                }
+            }
         };
 
         let mut writer_lock = self.writer.lock().await;
@@ -39,6 +51,27 @@ impl Control {
     }
 
     async fn register_tunnel(self: &Arc<Self>, np: &NewTunnel) -> Result<String> {
+        // #11: reject over-limit registrations before any listener or
+        // route is created. A rejection lands in NewTunnelResp.error via
+        // handle_new_tunnel; nothing is created on this path.
+        let is_reregister = self.has_tunnel(&np.tunnel_name).await;
+        let tunnels_in_session = self.tunnel_count().await;
+        super::validate::validate_new_tunnel(np, tunnels_in_session, is_reregister)
+            .map_err(|e| anyhow!("{e}"))?;
+        // #11: enforce the session token's policy before any listener or
+        // route is created. A rejection lands in NewTunnelResp.error via
+        // handle_new_tunnel; nothing is created on this path.
+        let remote_port = if (1..=65535).contains(&np.remote_port) {
+            Some(np.remote_port as u16)
+        } else {
+            None
+        };
+        self.access_policy().await.authorize_proxy(
+            self.token_id(),
+            &np.tunnel_name,
+            &np.protocol,
+            remote_port,
+        )?;
         match np.protocol.as_str() {
             "tcp" => self.register_tcp_tunnel(np).await,
             "http" => self.register_http_tunnel(np).await,
@@ -73,6 +106,10 @@ impl Control {
         let control = Arc::clone(self);
 
         {
+            // #11: the old listener must be released before the new one
+            // can bind the same port, so TCP keeps the remove-first order
+            // (unlike HTTP/HTTPS, whose registration is atomic). A failed
+            // re-bind therefore still loses the old tunnel, as before.
             let mut tm = self.tunnels.lock().await;
             if let Some(old_ty) = tm.remove(&name).await {
                 self.metrics.close_tunnel(&name, old_ty);
@@ -85,7 +122,7 @@ impl Control {
             remote_port,
             control,
             limiter,
-            Arc::clone(&self.access),
+            self.access_policy().await,
         )
         .await?;
         let remote_addr = format!(":{}", remote_port);
@@ -121,12 +158,10 @@ impl Control {
         }
 
         let name = np.tunnel_name.clone();
-        {
-            let mut tm = self.tunnels.lock().await;
-            if let Some(old_ty) = tm.remove(&name).await {
-                self.metrics.close_tunnel(&name, old_ty);
-            }
-        }
+        // #11: no tm.remove here: HttpTunnel::register is atomic (a
+        // conflict adds no route), and TunnelManager::insert below closes
+        // the old tunnel only after the new one succeeds, so a failed
+        // registration keeps the previous tunnel of the same name.
 
         let tunnel = HttpTunnel::register(
             np,
@@ -174,12 +209,8 @@ impl Control {
         }
 
         let name = np.tunnel_name.clone();
-        {
-            let mut tm = self.tunnels.lock().await;
-            if let Some(old_ty) = tm.remove(&name).await {
-                self.metrics.close_tunnel(&name, old_ty);
-            }
-        }
+        // #11: no tm.remove here, same as HTTP: HttpsTunnel::register is
+        // atomic and insert below closes the old tunnel only on success.
 
         let tunnel = HttpsTunnel::register(
             np,
@@ -233,6 +264,8 @@ impl Control {
         let max_connections = np.max_connections;
 
         {
+            // #11: same as TCP above — the old socket must be released
+            // before the new one can bind the same port.
             let mut tm = self.tunnels.lock().await;
             if let Some(old_ty) = tm.remove(&name).await {
                 self.metrics.close_tunnel(&name, old_ty);
@@ -247,6 +280,7 @@ impl Control {
             limiter,
             packet_size,
             max_connections,
+            self.access_policy().await,
         )
         .await?;
         let remote_addr = format!(":{}", remote_port);

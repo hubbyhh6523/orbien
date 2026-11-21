@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Result};
+use orbien_core::auth;
 use orbien_core::net::{try_consume_proxy_protocol, PpConsume, PROXY_PROTOCOL_MAX_HEADER};
 use orbien_core::tls::PrefixedStream;
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,9 @@ pub struct TokenAccessPolicy {
     pub allowed_tunnels: HashSet<String>,
     pub allowed_protocols: HashSet<String>,
     pub allowed_remote_ports: HashSet<u16>,
+    /// Normalized `allowed_domains` patterns: exact lowercase domains and
+    /// `*.suffix` wildcards. Empty = only names under `rootDomain`.
+    pub allowed_domains: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,12 @@ impl AccessPolicy {
             if token.is_empty() {
                 continue;
             }
+            // #11: the map is keyed by token id (SHA-256 hex), never the
+            // raw token. Two entries for the same token are a config error.
+            let id = auth::token_id(token);
+            if token_policies.contains_key(&id) {
+                bail!("duplicate token in token_policies");
+            }
             let tunnels = policy
                 .allowed_tunnels
                 .iter()
@@ -71,12 +81,18 @@ impl AccessPolicy {
                 .copied()
                 .filter(|p| *p > 0)
                 .collect::<HashSet<_>>();
+            let domains = policy
+                .allowed_domains
+                .iter()
+                .map(|s| normalize_domain_pattern(s))
+                .collect::<Result<HashSet<_>>>()?;
             token_policies.insert(
-                token.to_string(),
+                id,
                 TokenAccessPolicy {
                     allowed_tunnels: tunnels,
                     allowed_protocols: protocols,
                     allowed_remote_ports: ports,
+                    allowed_domains: domains,
                 },
             );
         }
@@ -99,6 +115,8 @@ impl AccessPolicy {
         !self.deny_src_cidrs.is_empty() && self.deny_src_cidrs.iter().any(|c| c.contains(ip))
     }
 
+    /// Check a tunnel registration against the token's policy (#11).
+    /// `token` is the token id (SHA-256 hex), as stored on the session.
     pub fn authorize_proxy(
         &self,
         token: &str,
@@ -110,7 +128,7 @@ impl AccessPolicy {
             // Fail-closed: if token policies are configured but this token
             // is not listed, deny access to prevent allowlist bypass.
             if !self.token_policies.is_empty() {
-                bail!("token '{token}' is not authorized for proxy registration");
+                bail!("token is not authorized for proxy registration");
             }
             // No policies configured at all — allow (backward compatibility).
             return Ok(());
@@ -138,6 +156,110 @@ impl AccessPolicy {
 
         Ok(())
     }
+
+    /// Check every domain an http/https tunnel wants to register (#11).
+    /// `token` is the token id (SHA-256 hex), as stored on the session.
+    ///
+    /// `domains` are the final names after `build_domains` expansion, so
+    /// subdomain prefixes under `rootDomain` are covered too. Rules:
+    /// - no policy for this token and policies configured at all: deny
+    ///   (fail-closed, same as `authorize_proxy`);
+    /// - no policies configured, or the policy has empty `allowed_domains`:
+    ///   only names under `rootDomain`;
+    /// - otherwise every domain must match an exact pattern or a
+    ///   `*.suffix` pattern in the policy.
+    pub fn authorize_domains(
+        &self,
+        token: &str,
+        domains: &[String],
+        root_domain: &str,
+    ) -> Result<()> {
+        let root = root_domain.trim().to_ascii_lowercase();
+        let under_root = |d: &str| {
+            !root.is_empty() && (d == root || d.ends_with(&format!(".{root}")))
+        };
+        let policy = self.token_policies.get(token);
+        match policy {
+            None => {
+                if !self.token_policies.is_empty() {
+                    bail!("token is not authorized for domain registration");
+                }
+                for d in domains {
+                    let d = d.trim().to_ascii_lowercase();
+                    if !under_root(&d) {
+                        bail!("domain {d} is outside rootDomain");
+                    }
+                }
+                Ok(())
+            }
+            Some(policy) => {
+                if policy.allowed_domains.is_empty() {
+                    for d in domains {
+                        let d = d.trim().to_ascii_lowercase();
+                        if !under_root(&d) {
+                            bail!("domain {d} is outside rootDomain");
+                        }
+                    }
+                    return Ok(());
+                }
+                for d in domains {
+                    let d = d.trim().to_ascii_lowercase();
+                    if !policy
+                        .allowed_domains
+                        .iter()
+                        .any(|p| domain_matches_pattern(&d, p))
+                    {
+                        bail!("domain {d} is not allowed by this token's policy");
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `*.suffix` matches any name strictly below `suffix` (`a.example.com`,
+/// `a.b.example.com`, but not `example.com` itself); anything else must
+/// match exactly. Patterns are already normalized (see
+/// `normalize_domain_pattern`).
+fn domain_matches_pattern(domain: &str, pattern: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        domain.len() > suffix.len() + 1 && domain.ends_with(&format!(".{suffix}"))
+    } else {
+        domain == pattern
+    }
+}
+
+/// Normalize one `allowed_domains` entry to a lowercase exact domain or
+/// `*.suffix` pattern. Anything else fails here so a typo is caught at
+/// startup / `--check-config` instead of silently never matching.
+fn normalize_domain_pattern(entry: &str) -> Result<String> {
+    let e = entry.trim().to_ascii_lowercase();
+    if e.is_empty() {
+        bail!("invalid allowed_domains pattern {entry:?}: empty");
+    }
+    if !e
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '*')
+    {
+        bail!("invalid allowed_domains pattern {entry:?}: bad character");
+    }
+    if e.starts_with('.') || e.ends_with('.') || e.contains("..") {
+        bail!("invalid allowed_domains pattern {entry:?}");
+    }
+    let suffix = e.strip_prefix("*.").unwrap_or(&e);
+    if suffix.contains('*') {
+        bail!("invalid allowed_domains pattern {entry:?}: '*' only allowed as leading '*.'");
+    }
+    if suffix.is_empty() {
+        bail!("invalid allowed_domains pattern {entry:?}: empty suffix");
+    }
+    for label in suffix.split('.') {
+        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            bail!("invalid allowed_domains pattern {entry:?}: bad label");
+        }
+    }
+    Ok(e)
 }
 
 pub struct IngressConn {
@@ -309,6 +431,7 @@ fn ipv6_in_cidr(net: Ipv6Addr, prefix: u8, ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{AccessPolicy, TokenAccessPolicy};
+    use orbien_core::auth::token_id;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
@@ -361,6 +484,7 @@ mod tests {
             allowed_tunnels: hs_str(&["db"]),
             allowed_protocols: hs_str(&["tcp"]),
             allowed_remote_ports: hs_u16(&[3306]),
+            allowed_domains: hs_str(&[]),
         });
         assert!(p.authorize_proxy("tok-a", "db", "tcp", Some(3306)).is_ok());
     }
@@ -432,5 +556,150 @@ mod tests {
             ..Default::default()
         });
         assert!(p.authorize_proxy("tok-a", "any", "http", None).is_ok());
+    }
+
+    // ── #11: allowed_domains ─────────────────────────────────────────────
+
+    fn domains(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn authorize_domains_allows_under_root_without_policies() {
+        let p = base_policy();
+        assert!(p
+            .authorize_domains("any-token", &domains(&["app.example.com"]), "example.com")
+            .is_ok());
+        assert!(p
+            .authorize_domains("any-token", &domains(&["example.com"]), "example.com")
+            .is_ok());
+    }
+
+    #[test]
+    fn authorize_domains_rejects_outside_root_without_policies() {
+        let p = base_policy();
+        assert!(p
+            .authorize_domains("any-token", &domains(&["evil.com"]), "example.com")
+            .is_err());
+        // Empty rootDomain: nothing is under it.
+        assert!(p
+            .authorize_domains("any-token", &domains(&["app.example.com"]), "")
+            .is_err());
+    }
+
+    #[test]
+    fn authorize_domains_empty_policy_allows_only_root() {
+        let p = policy(TokenAccessPolicy {
+            allowed_domains: hs_str(&[]),
+            ..Default::default()
+        });
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["app.example.com"]), "example.com")
+            .is_ok());
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["evil.com"]), "example.com")
+            .is_err());
+    }
+
+    #[test]
+    fn authorize_domains_matches_exact_and_wildcard() {
+        let p = policy(TokenAccessPolicy {
+            allowed_domains: hs_str(&["app.example.com", "*.example.org"]),
+            ..Default::default()
+        });
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["app.example.com"]), "other.test")
+            .is_ok());
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["a.example.org"]), "other.test")
+            .is_ok());
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["a.b.example.org"]), "other.test")
+            .is_ok());
+        // The suffix itself is not covered by `*.suffix`.
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["example.org"]), "other.test")
+            .is_err());
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["other.com"]), "other.test")
+            .is_err());
+        // Case-insensitive.
+        assert!(p
+            .authorize_domains("tok-a", &domains(&["APP.EXAMPLE.COM"]), "other.test")
+            .is_ok());
+    }
+
+    #[test]
+    fn authorize_domains_denies_unlisted_token_when_policies_exist() {
+        let p = policy(TokenAccessPolicy {
+            allowed_domains: hs_str(&["app.example.com"]),
+            ..Default::default()
+        });
+        assert!(p
+            .authorize_domains("tok-unknown", &domains(&["app.example.com"]), "example.com")
+            .is_err());
+    }
+
+    #[test]
+    fn normalize_domain_pattern_rejects_bad_patterns() {
+        for bad in [
+            "",
+            "*",
+            "*.",
+            "bad_*.com",
+            "*.bad_*.com",
+            "foo.*.com",
+            ".example.com",
+            "example.com.",
+            "foo..bar",
+            "exa mple.com",
+            "a_b.com",
+            "-bad.com",
+            "bad-.com",
+        ] {
+            assert!(
+                super::normalize_domain_pattern(bad).is_err(),
+                "pattern {bad:?} must be rejected"
+            );
+        }
+        for good in ["example.com", "*.example.com", "a-b.example-2.com", "EXAMPLE.COM"] {
+            let normalized = super::normalize_domain_pattern(good).unwrap();
+            assert_eq!(normalized, good.to_ascii_lowercase());
+        }
+    }
+
+    #[test]
+    fn from_server_config_keys_policies_by_token_id() {
+        use orbien_core::config::ServerConfig;
+        let cfg: ServerConfig = toml::from_str(
+            "[[auth.token_policies]]\ntoken = 'tok-a'\nallowed_tunnels = ['db']\n",
+        )
+        .unwrap();
+        let p = AccessPolicy::from_server_config(&cfg).unwrap();
+        // Looked up by id, never by raw token.
+        assert!(p.authorize_proxy(&token_id("tok-a"), "db", "tcp", None).is_ok());
+        assert!(p.authorize_proxy("tok-a", "db", "tcp", None).is_err());
+    }
+
+    #[test]
+    fn from_server_config_rejects_duplicate_tokens_and_bad_patterns() {
+        use orbien_core::config::ServerConfig;
+        let dup: ServerConfig = toml::from_str(
+            "[[auth.token_policies]]\ntoken = 'tok-a'\n\
+             [[auth.token_policies]]\ntoken = 'tok-a'\n",
+        )
+        .unwrap();
+        let err = AccessPolicy::from_server_config(&dup).unwrap_err();
+        assert!(err.to_string().contains("duplicate token"), "{err}");
+        let bad: ServerConfig = toml::from_str(
+            "[[auth.token_policies]]\ntoken = 'tok-a'\n\
+             allowed_domains = ['bad_*.com']\n",
+        )
+        .unwrap();
+        let err = AccessPolicy::from_server_config(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid allowed_domains pattern"),
+            "{err}"
+        );
     }
 }

@@ -1,0 +1,4 @@
+# expect-error: invalid allowed_domains pattern
+[[auth.token_policies]]
+token = "tok-a"
+allowed_domains = ["bad_*.com"]

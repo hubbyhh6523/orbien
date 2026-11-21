@@ -43,6 +43,7 @@ impl ServerConfig {
                 ("allowed_tunnels", policy.allowed_tunnels.iter().all(|s| s.trim().is_empty())),
                 ("allowed_protocols", policy.allowed_protocols.iter().all(|s| s.trim().is_empty())),
                 ("allowed_remote_ports", policy.allowed_remote_ports.iter().all(|p| *p == 0)),
+                ("allowed_domains", policy.allowed_domains.iter().all(|s| s.trim().is_empty())),
             ] {
                 if empty {
                     out.push(format!("[unrestricted-policy] {path}.{dimension} has no effective restriction"));

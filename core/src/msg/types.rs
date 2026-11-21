@@ -44,6 +44,10 @@ pub struct Login {
     pub session_id: String,
     #[serde(default)]
     pub pool_count: i32,
+    /// HMAC proof of the resume secret for `session_id` (#11). Empty on a
+    /// fresh login or when the client has no stored secret.
+    #[serde(default)]
+    pub resume_proof: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +58,11 @@ pub struct LoginResp {
     pub session_id: String,
     #[serde(default)]
     pub error: String,
+    /// Hex-encoded 32-byte session secret, issued by the server at login
+    /// (#11). The client stores it and uses it for resume and data-conn
+    /// proofs; empty when login failed.
+    #[serde(default)]
+    pub resume_token: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -122,6 +131,11 @@ pub struct NewDataConn {
     pub auth_digest: String,
     #[serde(default)]
     pub timestamp: i64,
+    /// HMAC proof of the session secret, purpose `"data-conn"` (#11).
+    /// Required since #11; `auth_digest`/`timestamp` are kept as
+    /// transition fields and no longer authenticate anything.
+    #[serde(default)]
+    pub proof: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

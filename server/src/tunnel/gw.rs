@@ -1,12 +1,21 @@
 use crate::control::Control;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Weak;
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct HttpRoute {
     pub tunnel_name: String,
+    /// Session that owns this route. A domain is owned by the first live
+    /// session that registers under it; other sessions are refused for any
+    /// location or routeByHTTPUser value under that domain (#11).
+    pub owner_session_id: String,
     pub control: Weak<Control>,
+    /// Registration generation, stamped by `HttpGw::register_all`. The
+    /// owning tunnel removes only its own generation on close, so replacing
+    /// a tunnel never deletes the replacement's routes (#11).
+    pub generation: u64,
     pub location: String,
     pub host_header_rewrite: String,
     pub basic_auth_user: String,
@@ -19,6 +28,7 @@ type DomainIndex = HashMap<String, HashMap<String, Vec<HttpRoute>>>;
 
 pub struct HttpGw {
     routes: Mutex<DomainIndex>,
+    next_generation: AtomicU64,
     pub listen_port: u16,
 }
 
@@ -26,41 +36,127 @@ impl HttpGw {
     pub fn new(listen_port: u16) -> Self {
         Self {
             routes: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
             listen_port,
         }
     }
 
-    pub async fn register(&self, domain: &str, route: HttpRoute) -> anyhow::Result<()> {
-        let key = normalize_host(domain);
-        if key.is_empty() {
-            return Err(anyhow::anyhow!("empty http domain"));
-        }
-        let mut map = self.routes.lock().await;
-        let by_user = map.entry(key.clone()).or_default();
-        let list = by_user.entry(route.route_by_http_user.clone()).or_default();
-
-        if let Some(existing) = list.iter().find(|r| r.location == route.location) {
-            if existing.tunnel_name != route.tunnel_name {
-                return Err(anyhow::anyhow!(
-                    "router config conflict: domain={key} location={} routeByHTTPUser={}",
-                    route.location,
-                    route.route_by_http_user
-                ));
+    /// Validate every (domain, route) pair first, then add all of them
+    /// under one lock; any conflict adds nothing. Returns the generation
+    /// stamped on the new routes. A domain is owned by the first live
+    /// session that registers under it: a different session is refused
+    /// for any location or routeByHTTPUser value under that domain, and a
+    /// route whose owner is gone (its Weak no longer upgrades) is evicted
+    /// and does not block (#11).
+    pub async fn register_all(
+        &self,
+        session_id: &str,
+        routes: Vec<(String, HttpRoute)>,
+    ) -> anyhow::Result<u64> {
+        let mut pending: Vec<(String, HttpRoute)> = Vec::with_capacity(routes.len());
+        for (domain, route) in routes {
+            let key = normalize_host(&domain);
+            if key.is_empty() {
+                return Err(anyhow::anyhow!("empty http domain"));
             }
-            list.retain(|r| r.location != route.location);
+            pending.push((key, route));
         }
-
-        list.push(route);
-        list.sort_by(|a, b| b.location.cmp(&a.location));
-        tracing::info!(domain = %key, "http route registered");
-        Ok(())
+        if pending.is_empty() {
+            return Err(anyhow::anyhow!("no http routes to register"));
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        let mut map = self.routes.lock().await;
+        // Evict dead routes under the touched domains first.
+        for (key, _) in &pending {
+            let mut empty = false;
+            if let Some(by_user) = map.get_mut(key) {
+                by_user.retain(|_, list| {
+                    list.retain(|r| r.control.upgrade().is_some());
+                    !list.is_empty()
+                });
+                empty = by_user.is_empty();
+            }
+            if empty {
+                map.remove(key);
+            }
+        }
+        // Pre-check everything before writing anything.
+        let mut seen: HashMap<(String, String, String), String> = HashMap::new();
+        for (key, route) in &pending {
+            if let Some(by_user) = map.get(key) {
+                for list in by_user.values() {
+                    for existing in list {
+                        if existing.owner_session_id != session_id {
+                            return Err(anyhow::anyhow!(
+                                "http domain {key} is owned by another session"
+                            ));
+                        }
+                    }
+                }
+                if let Some(list) = by_user.get(&route.route_by_http_user) {
+                    if let Some(existing) =
+                        list.iter().find(|r| r.location == route.location)
+                    {
+                        if existing.tunnel_name != route.tunnel_name {
+                            return Err(anyhow::anyhow!(
+                                "router config conflict: domain={key} location={} routeByHTTPUser={}",
+                                route.location,
+                                route.route_by_http_user
+                            ));
+                        }
+                    }
+                }
+            }
+            let slot = (
+                key.clone(),
+                route.route_by_http_user.clone(),
+                route.location.clone(),
+            );
+            if let Some(other) = seen.get(&slot) {
+                if other != &route.tunnel_name {
+                    return Err(anyhow::anyhow!(
+                        "router config conflict: domain={key} location={} routeByHTTPUser={}",
+                        route.location,
+                        route.route_by_http_user
+                    ));
+                }
+            }
+            seen.insert(slot, route.tunnel_name.clone());
+        }
+        // All checks passed: replace this session's routes for the tunnel
+        // under each touched domain (drops locations the new registration
+        // no longer covers), then insert the new routes.
+        for (key, mut route) in pending {
+            if let Some(by_user) = map.get_mut(&key) {
+                for list in by_user.values_mut() {
+                    list.retain(|r| {
+                        !(r.owner_session_id == session_id
+                            && r.tunnel_name == route.tunnel_name)
+                    });
+                }
+            }
+            route.generation = generation;
+            let by_user = map.entry(key.clone()).or_default();
+            let list = by_user.entry(route.route_by_http_user.clone()).or_default();
+            list.push(route);
+            list.sort_by(|a, b| b.location.cmp(&a.location));
+            tracing::info!(domain = %key, "http route registered");
+        }
+        Ok(generation)
     }
 
-    pub async fn unregister_tunnel(&self, tunnel_name: &str) {
+    /// Remove only the routes of one registration generation of one
+    /// session's tunnel. Other tunnels of the same session, and a
+    /// replacement tunnel with the same name, are left alone (#11).
+    pub async fn unregister_tunnel(&self, session_id: &str, tunnel_name: &str, generation: u64) {
         let mut map = self.routes.lock().await;
         map.retain(|_, by_user| {
             by_user.retain(|_, list| {
-                list.retain(|r| r.tunnel_name != tunnel_name);
+                list.retain(|r| {
+                    !(r.owner_session_id == session_id
+                        && r.tunnel_name == tunnel_name
+                        && r.generation == generation)
+                });
                 !list.is_empty()
             });
             !by_user.is_empty()
