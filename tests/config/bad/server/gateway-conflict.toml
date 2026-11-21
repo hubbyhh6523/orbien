@@ -1,0 +1,2 @@
+# expect-error: must not share a TCP listen
+httpGwPort = 9527

@@ -1,0 +1,3 @@
+# expect-error: dashboard.user and dashboard.password
+[dashboard]
+port = 8020

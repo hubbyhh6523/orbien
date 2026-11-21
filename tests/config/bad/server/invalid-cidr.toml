@@ -1,0 +1,2 @@
+# expect-error: access policy preflight
+denySrcCidrs = ["10.0.0.0/99"]

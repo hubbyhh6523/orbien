@@ -1,0 +1,4 @@
+# expect-error: transport.tls preflight
+[transport.tls]
+certFile = "missing-cert.pem"
+keyFile = "missing-key.pem"

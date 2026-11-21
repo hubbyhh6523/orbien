@@ -1,0 +1,4 @@
+# expect-error: unknown field `allowed_remote_port`
+[[auth.token_policies]]
+token = "candidate"
+allowed_remote_port = [5432]
