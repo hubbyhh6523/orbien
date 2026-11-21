@@ -1,0 +1,3 @@
+# expect-error: transport.tls preflight
+[transport.tls]
+trustedCaFile = "missing-ca.pem"

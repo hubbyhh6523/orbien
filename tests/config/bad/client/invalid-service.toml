@@ -1,0 +1,6 @@
+# expect-error: service must include a port
+[[tunnels]]
+name = "db"
+protocol = "tcp"
+remotePort = 3306
+service = "localhost"
