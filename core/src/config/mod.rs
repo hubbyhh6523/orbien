@@ -1,6 +1,9 @@
+mod check;
 mod client;
 mod env;
 mod server;
+
+pub use check::print_config_warnings;
 
 pub use client::{
     ClientConfig, ClientTlsConfig, PluginConfig, PluginRequestHeaders, TransportConfig,
