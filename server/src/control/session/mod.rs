@@ -319,10 +319,8 @@ impl Control {
                         if let Err(e) = handler(p2p_msg, sid, peer).await {
                             tracing::warn!(error = %e, "P2P broker dispatch error");
                         }
-                    } else {
-                        if self.log_throttle.should_log() {
-                            tracing::warn!("P2P message received but no handler registered");
-                        }
+                    } else if self.log_throttle.should_log() {
+                        tracing::warn!("P2P message received but no handler registered");
                     }
                 }
 

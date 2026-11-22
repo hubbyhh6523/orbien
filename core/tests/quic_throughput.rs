@@ -1,9 +1,16 @@
 //! Minimal loopback QUIC throughput smoke (#13).
 //!
-//! Transfers 100 MiB over one QUIC stream with the old windows
+//! Transfers 32 MiB over one QUIC stream with the old windows
 //! (100_000 streams, 32/64/64 MiB) and with the new defaults
 //! (1_000 streams, 1/8/8 MiB) and prints both timings, so a regression
 //! from the lowered defaults shows up here and in CI.
+//!
+//! The sender paces itself (2 ms per MiB): without pacing, the initial
+//! burst on Windows loopback drops UDP datagrams, the receiver's
+//! reassembly buffer overflows quinn's 1024-chunk cap ("too many gaps
+//! in stream buffer") and the peer aborts the connection. 32 MiB is
+//! still 32x the new 1 MiB stream window, so the window comparison
+//! still shows.
 //!
 //! The sandbox blocks UDP sendto (EPERM, even loopback), so the test
 //! probes for that first and skips cleanly with a message instead of
@@ -17,9 +24,11 @@ use orbien_core::transport::{
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 
-const TRANSFER_BYTES: usize = 100 * 1024 * 1024;
+const TRANSFER_BYTES: usize = 32 * 1024 * 1024;
+/// Pause the sender this long per MiB written, so bursts stay small
+/// enough for the receiver's UDP socket buffer to absorb.
+const PACE_PER_MIB: Duration = Duration::from_millis(2);
 
 /// True when this machine cannot send UDP at all (sandbox EPERM).
 fn udp_blocked() -> bool {
@@ -80,10 +89,16 @@ async fn transfer(quic: &QuicOptions, cert: &str, key: &str) -> Result<Duration>
     let (mut send, _recv) = conn.open_bi().await.context("open_bi")?;
     let chunk = vec![0xabu8; 64 * 1024];
     let mut left = TRANSFER_BYTES;
+    let mut since_pace = 0usize;
     while left > 0 {
         let n = left.min(chunk.len());
         send.write_all(&chunk[..n]).await.context("client write")?;
         left -= n;
+        since_pace += n;
+        if since_pace >= 1024 * 1024 {
+            since_pace = 0;
+            tokio::time::sleep(PACE_PER_MIB).await;
+        }
     }
     send.finish().context("client finish")?;
     let elapsed = start.elapsed();
