@@ -1,0 +1,9 @@
+# expect-error: transport.quic.streamRecvWindow must be > 0
+listen = "127.0.0.1:9527"
+
+[auth]
+type = "token"
+token = "test-token"
+
+[transport.quic]
+streamRecvWindow = 0

@@ -1,6 +1,7 @@
 mod dashboard_view;
 mod ingress;
 mod p2p_broker;
+mod pre_login;
 mod session_registry;
 
 use crate::access::AccessPolicy;
@@ -11,6 +12,7 @@ use anyhow::{anyhow, Result};
 use orbien_core::config::ServerConfig;
 use orbien_core::transport;
 use p2p_broker::P2pBroker;
+use pre_login::PreLoginGate;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,6 +55,8 @@ pub struct Service {
     metrics: Arc<MemMetrics>,
     /// Broker for P2P direct-tunnel handshakes.
     p2p: Arc<P2pBroker>,
+    /// Pre-login connection gate (#13): caps unauthenticated connections.
+    pre_login: Arc<PreLoginGate>,
 }
 
 impl Service {
@@ -73,6 +77,15 @@ impl Service {
         if tls.force {
             tracing::info!("transport.tls.force=true — non-TLS control connections rejected");
         }
+        let limits = cfg.limits.clone();
+        tracing::info!(
+            pre_login_timeout_secs = limits.pre_login_timeout_secs,
+            first_message_max_bytes = limits.first_message_max_bytes,
+            pre_login_max_conns = limits.pre_login_max_conns,
+            pre_login_max_conns_per_ip = limits.pre_login_max_conns_per_ip,
+            idle_timeout_secs = limits.idle_timeout_secs,
+            "pre-login limits"
+        );
         Ok(Self {
             cfg,
             access,
@@ -83,6 +96,10 @@ impl Service {
             tls_config,
             metrics: MemMetrics::new(),
             p2p: P2pBroker::new(),
+            pre_login: PreLoginGate::new(
+                limits.pre_login_max_conns,
+                limits.pre_login_max_conns_per_ip,
+            ),
         })
     }
 
@@ -123,9 +140,7 @@ impl Service {
             let quic_addr = Self::transport_bind_addr(&this.cfg, this.cfg.quic_port)?;
             let endpoint = transport::build_server_endpoint(
                 quic_addr,
-                this.cfg.transport.quic.keepalive(),
-                this.cfg.transport.quic.idle_timeout(),
-                this.cfg.transport.quic.max_incoming_streams,
+                &this.cfg.transport.quic,
                 &this.cfg.transport.tls.cert_file,
                 &this.cfg.transport.tls.key_file,
                 &this.cfg.transport.tls.trusted_ca_file,
@@ -165,7 +180,14 @@ impl Service {
         while set.join_next().await.is_some() {}
 
         match first {
-            Ok(Ok(())) => Ok(()),
+            // #13: a listener that ends on its own is abnormal — the
+            // server used to exit 0 when one gateway's accept loop broke,
+            // silently killing every tunnel. Now the process fails loudly
+            // so the supervisor restarts it.
+            Ok(Ok(())) => {
+                tracing::error!("listener exited unexpectedly; shutting down");
+                Err(anyhow!("listener exited unexpectedly"))
+            }
             Ok(Err(e)) => Err(e),
             Err(e) if e.is_cancelled() => Ok(()),
             Err(e) => Err(anyhow!("listener task join: {e}")),

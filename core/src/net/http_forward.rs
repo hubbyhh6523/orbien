@@ -1,9 +1,10 @@
 use super::http_head::{rewrite_request_head, Rewrite};
+use crate::io::{ByteCounter, CountingStream};
 use anyhow::{anyhow, ensure, Context, Result};
 use std::io::Cursor;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_FIELDS: usize = 128;
@@ -14,12 +15,17 @@ const MAX_TRAILERS: usize = 16 * 1024;
 pub struct ForwardLimits {
     /// Absolute exchange deadline, not an idle timeout. CONNECT is exempt.
     pub exchange_timeout: Duration,
+    /// Abort the exchange once no bytes flow for this long (#13).
+    /// `None` disables the idle watchdog; the 300 s absolute deadline
+    /// still applies. CONNECT uses the same value via the join.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for ForwardLimits {
     fn default() -> Self {
         Self {
             exchange_timeout: Duration::from_secs(300),
+            idle_timeout: None,
         }
     }
 }
@@ -598,9 +604,16 @@ where
         upstream.write_all(&buffered).await?;
         upstream.flush().await?;
 
-        let (sent, received) =
-            tokio::io::copy_bidirectional(&mut visitor, &mut upstream)
-                .await?;
+        let (sent, received) = match limits.idle_timeout {
+            Some(idle) => {
+                let (s, r, err) = crate::io::join_counted_idle(visitor, upstream, idle).await;
+                match err {
+                    Some(e) => return Err(e.into()),
+                    None => (s, r),
+                }
+            }
+            None => tokio::io::copy_bidirectional(&mut visitor, &mut upstream).await?,
+        };
 
         return Ok(ForwardStats {
             to_upstream: buffered.len() as u64 + sent,
@@ -611,42 +624,81 @@ where
     let rewritten = encode_head(&head, true)?;
     let pending = buffered[head.end..].to_vec();
 
+    // Counting wrappers so the idle watchdog below can see progress
+    // while the exchange runs. The buffered head was already read
+    // before the wrap, so it is not counted — the rewritten head write
+    // is the first counted byte.
+    let cv = ByteCounter::new();
+    let cu = ByteCounter::new();
+    let visitor = CountingStream::new(visitor, cv.clone());
+    let upstream = CountingStream::new(upstream, cu.clone());
     let (vr, mut vw) = tokio::io::split(visitor);
     let (mut ur, mut uw) = tokio::io::split(upstream);
     let mut sent = 0u64;
     let mut received = 0u64;
 
-    timeout(limits.exchange_timeout, async {
-        {
-            let upload = async {
-                write_bytes(&mut uw, &rewritten, &mut sent).await?;
-                uw.flush().await?;
+    // The exchange future borrows `sent`/`received` mutably, so it runs
+    // inside this block: it is dropped before the stats below read them.
+    {
+        let exchange = timeout(limits.exchange_timeout, async {
+            {
+                let upload = async {
+                    write_bytes(&mut uw, &rewritten, &mut sent).await?;
+                    uw.flush().await?;
 
-                let mut source = Cursor::new(pending).chain(vr);
-                body(&mut source, &mut uw, mode, &mut sent).await
-            };
+                    let mut source = Cursor::new(pending).chain(vr);
+                    body(&mut source, &mut uw, mode, &mut sent).await
+                };
 
-            let download =
-                response(&mut ur, &mut vw, is_head, &mut received);
+                let download =
+                    response(&mut ur, &mut vw, is_head, &mut received);
 
-            tokio::pin!(upload);
-            tokio::pin!(download);
+                tokio::pin!(upload);
+                tokio::pin!(download);
 
-            tokio::select! {
-                result = &mut upload => {
-                    result?;
-                    download.await?;
+                tokio::select! {
+                    result = &mut upload => {
+                        result?;
+                        download.await?;
+                    }
+                    result = &mut download => {
+                        result?;
+                    }
                 }
-                result = &mut download => {
-                    result?;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        });
+        tokio::pin!(exchange);
+        match limits.idle_timeout {
+            None => {
+                exchange
+                    .await
+                    .context("HTTP exchange deadline exceeded")??;
+            }
+            Some(idle) => {
+                let mut last_total = 0u64;
+                let mut last_progress = Instant::now();
+                loop {
+                    tokio::select! {
+                        r = &mut exchange => {
+                            r.context("HTTP exchange deadline exceeded")??;
+                            break;
+                        }
+                        _ = sleep(Duration::from_secs(1)) => {
+                            let total = cv.read() + cv.written() + cu.read() + cu.written();
+                            if total != last_total {
+                                last_total = total;
+                                last_progress = Instant::now();
+                            } else if last_progress.elapsed() >= idle {
+                                return Err(anyhow!("HTTP exchange idle timeout"));
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("HTTP exchange deadline exceeded")??;
+    }
 
     Ok(ForwardStats {
         to_upstream: sent,

@@ -91,6 +91,7 @@ async fn run_wire(
             buffered,
             ForwardLimits {
                 exchange_timeout: Duration::from_secs(3),
+                idle_timeout: None,
             },
         )
         .await
@@ -222,6 +223,7 @@ async fn continue_is_delivered_before_upload_is_complete() {
             head,
             ForwardLimits {
                 exchange_timeout: Duration::from_secs(3),
+                idle_timeout: None,
             },
         )
         .await

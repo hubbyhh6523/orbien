@@ -2,7 +2,7 @@ mod codec;
 mod types;
 
 pub use codec::{
-    read_msg, read_msg_timeout, write_msg, MessageReadError, MessageWriteError,
-    DEFAULT_READ_TIMEOUT,
+    max_bytes_for_type, read_msg, read_msg_limited, read_msg_limited_timeout,
+    read_msg_with_limits, write_msg, MessageReadError, MessageWriteError,
 };
 pub use types::*;

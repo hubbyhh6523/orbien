@@ -17,7 +17,7 @@ heartbeatTimeout = 90
 [transport.quic]
 keepalivePeriod = 10
 maxIdleTimeout = 30
-maxIncomingStreams = 100000
+maxIncomingStreams = 1000
 
 [transport.tls]
 enable = true

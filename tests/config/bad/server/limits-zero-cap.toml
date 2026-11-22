@@ -1,0 +1,9 @@
+# expect-error: limits.preLoginMaxConns must be > 0
+listen = "127.0.0.1:9527"
+
+[auth]
+type = "token"
+token = "test-token"
+
+[limits]
+preLoginMaxConns = 0

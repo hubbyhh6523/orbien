@@ -19,6 +19,7 @@ steps=(
   05-token.sh
   06-dashboard.sh
   07-token-policy.sh
+  08-limits.sh
 )
 
 for step in "${steps[@]}"; do

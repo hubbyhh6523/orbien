@@ -18,7 +18,7 @@ use orbien_core::transport::DynStream;
 use orbien_core::VERSION;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -37,6 +37,12 @@ type CtrlRead = ReadHalf<DynStream>;
 type CtrlWrite = WriteHalf<DynStream>;
 type OnTunnelRemote = Arc<dyn Fn(String, String) + Send + Sync>;
 
+/// Burst above `pool_count` the client tolerates for simultaneous
+/// `ReqDataConn` handling (#13). Mirrors the server's default
+/// `limits.maxOutstandingDataConns`; the server enforces its own
+/// configured cap too, this is the client-side backstop.
+const DATA_CONN_BURST: usize = 8;
+
 pub struct Control {
     cfg: ClientConfig,
     session_id: String,
@@ -49,6 +55,10 @@ pub struct Control {
     connector: Arc<dyn Connector>,
     cancel: CancellationToken,
     data_tasks: Mutex<JoinSet<()>>,
+    /// Data connections currently being opened (#13). A plain
+    /// `data_tasks.len()` cannot be used: `JoinSet::len` also counts
+    /// finished-but-unjoined tasks, so it would grow forever.
+    data_conns_in_flight: AtomicUsize,
     on_tunnel_remote: OnTunnelRemote,
     last_pong_unix: AtomicI64,
 }
@@ -154,6 +164,7 @@ impl Control {
             connector,
             cancel: session_cancel.clone(),
             data_tasks: Mutex::new(JoinSet::new()),
+            data_conns_in_flight: AtomicUsize::new(0),
             on_tunnel_remote,
             last_pong_unix: AtomicI64::new(now_secs()),
         });
@@ -315,17 +326,37 @@ impl Control {
                     return Ok(ReaderEnd::Kicked(k.reason));
                 }
                 Message::ReqDataConn(_) => {
+                    // #13: ignore requests above pool_count + burst.
+                    // A visitor flood must not turn into an unbounded
+                    // flood of connection attempts to the server.
+                    let cap =
+                        (self.cfg.transport.pool_count.max(1) as usize) + DATA_CONN_BURST;
+                    if self
+                        .data_conns_in_flight
+                        .fetch_add(1, Ordering::SeqCst)
+                        >= cap
+                    {
+                        self.data_conns_in_flight
+                            .fetch_sub(1, Ordering::SeqCst);
+                        tracing::debug!(
+                            cap,
+                            "ignoring ReqDataConn: too many data connections in flight"
+                        );
+                        continue;
+                    }
                     let ctl = Arc::clone(&self);
                     let cancel = self.cancel.clone();
                     self.data_tasks.lock().await.spawn(async move {
                         tokio::select! {
                             _ = cancel.cancelled() => {}
-                            res = ctl.handle_req_data_conn() => {
+                            res = ctl.clone().handle_req_data_conn() => {
                                 if let Err(e) = res {
                                     tracing::error!(error = %e, "data conn failed");
                                 }
                             }
                         }
+                        ctl.data_conns_in_flight
+                            .fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Message::NewTunnelResp(resp) => {

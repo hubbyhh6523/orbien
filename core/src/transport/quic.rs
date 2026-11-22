@@ -1,5 +1,6 @@
 use super::stream::{boxed_stream, DynStream};
 use super::tls::{self, server_crypto_from_tls_files};
+use crate::config::QuicOptions;
 use anyhow::{Context, Result};
 use quinn::{
     ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, ServerConfig,
@@ -13,9 +14,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
-const STREAM_RECV_WINDOW: u32 = 32 * 1024 * 1024;
-const CONN_RECV_WINDOW: u32 = 64 * 1024 * 1024;
-const SEND_WINDOW: u64 = 64 * 1024 * 1024;
 const UDP_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct QuicBiStream {
@@ -96,22 +94,17 @@ pub struct QuicSession {
 }
 
 impl QuicSession {
-    #[allow(clippy::too_many_arguments)] // 8 config params; kept flat for direct callers
     pub async fn dial(
         server_addr: SocketAddr,
         server_name: &str,
-        keepalive: Duration,
-        idle_timeout: Duration,
-        max_incoming_streams: u32,
+        quic: &QuicOptions,
         tls_cert: &str,
         tls_key: &str,
         tls_ca: &str,
         tofu_store: Option<&std::path::Path>,
     ) -> Result<Self> {
         let endpoint = build_client_endpoint(
-            keepalive,
-            idle_timeout,
-            Some(max_incoming_streams),
+            quic,
             tls_cert,
             tls_key,
             tls_ca,
@@ -163,23 +156,20 @@ impl QuicSession {
     }
 }
 
-fn high_perf_transport(
-    keepalive: Duration,
-    idle_timeout: Duration,
-    max_streams: Option<u32>,
-) -> Result<quinn::TransportConfig> {
+/// QUIC transport settings from one [`QuicOptions`]: keepalive, idle
+/// timeout, stream/window limits. The windows bound how much memory one
+/// unauthenticated peer can make an endpoint reserve (#13).
+fn high_perf_transport(quic: &QuicOptions) -> Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(idle_timeout.try_into().context("idle timeout")?));
-    transport.keep_alive_interval(Some(keepalive));
+    transport.max_idle_timeout(Some(quic.idle_timeout().try_into().context("idle timeout")?));
+    transport.keep_alive_interval(Some(quic.keepalive()));
 
-    transport.stream_receive_window(VarInt::from_u32(STREAM_RECV_WINDOW));
-    transport.receive_window(VarInt::from_u32(CONN_RECV_WINDOW));
-    transport.send_window(SEND_WINDOW);
+    transport.stream_receive_window(VarInt::from_u32(quic.stream_recv_window));
+    transport.receive_window(VarInt::from_u32(quic.conn_recv_window));
+    transport.send_window(quic.send_window);
 
     transport.initial_rtt(Duration::from_millis(5));
-    if let Some(n) = max_streams {
-        transport.max_concurrent_bidi_streams(n.into());
-    }
+    transport.max_concurrent_bidi_streams(quic.max_incoming_streams.into());
     Ok(transport)
 }
 
@@ -201,20 +191,14 @@ fn runtime() -> Result<Arc<dyn quinn::Runtime>> {
 
 pub fn build_server_endpoint(
     bind: SocketAddr,
-    keepalive: Duration,
-    idle_timeout: Duration,
-    max_streams: u32,
+    quic: &QuicOptions,
     tls_cert: &str,
     tls_key: &str,
     tls_ca: &str,
 ) -> Result<Endpoint> {
     let crypto = server_crypto_from_tls_files(tls_cert, tls_key, tls_ca)?;
     let mut server = ServerConfig::with_crypto(Arc::new(crypto));
-    server.transport_config(Arc::new(high_perf_transport(
-        keepalive,
-        idle_timeout,
-        Some(max_streams),
-    )?));
+    server.transport_config(Arc::new(high_perf_transport(quic)?));
 
     let socket = UdpSocket::bind(bind).context("bind quic udp")?;
     tune_udp_buffers(&socket);
@@ -223,9 +207,7 @@ pub fn build_server_endpoint(
 }
 
 pub fn build_client_endpoint(
-    keepalive: Duration,
-    idle_timeout: Duration,
-    max_streams: Option<u32>,
+    quic: &QuicOptions,
     tls_cert: &str,
     tls_key: &str,
     tls_ca: &str,
@@ -234,11 +216,7 @@ pub fn build_client_endpoint(
     let _ = tls::install_ring_provider();
     let crypto = tls::client_crypto_with_tofu(tls_cert, tls_key, tls_ca, tofu_store)?;
     let mut client = ClientConfig::new(Arc::new(crypto));
-    client.transport_config(Arc::new(high_perf_transport(
-        keepalive,
-        idle_timeout,
-        max_streams,
-    )?));
+    client.transport_config(Arc::new(high_perf_transport(quic)?));
 
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind quic client udp")?;
     tune_udp_buffers(&socket);

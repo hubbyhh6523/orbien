@@ -4,14 +4,16 @@ pub(crate) mod validate;
 
 use crate::access::AccessPolicy;
 use crate::metrics::{MemMetrics, ServerMetrics};
+use crate::ratelimit::LogThrottle;
 use crate::tunnel::{HttpGw, HttpsGw, TunnelManager};
 use anyhow::{anyhow, Result};
 use orbien_core::config::ServerConfig;
 use orbien_core::msg::{self, KickOut, Message, Ping, Pong};
 use orbien_core::transport::DynStream;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
@@ -50,9 +52,21 @@ pub struct Control {
     /// and so `shutdown()` can call `AsyncWriteExt::shutdown` cleanly.
     /// All writes (Pong, KickOut, P2P) serialize through this single Mutex.
     writer: Mutex<Option<CtrlWrite>>,
-    data_tx: mpsc::Sender<DynStream>,
-    data_rx: Mutex<mpsc::Receiver<DynStream>>,
+    data_tx: mpsc::Sender<(DynStream, Instant)>,
+    data_rx: Mutex<mpsc::Receiver<(DynStream, Instant)>>,
     data_notify: Notify,
+    /// Visitors waiting for a data connection, per tunnel name (#13).
+    /// std Mutex: the ops are two-line counter bumps, no await inside.
+    waiting_visitors: std::sync::Mutex<HashMap<String, usize>>,
+    /// `ReqDataConn` sent but not yet answered by a data connection
+    /// (#13). Capped at `pool_count + burst`; released in push_data_conn.
+    outstanding_data_conns: AtomicUsize,
+    /// Unknown control messages seen on this session (#13): more than
+    /// 10 disconnects it. Logs for them go through `log_throttle`.
+    unexpected_messages: AtomicUsize,
+    /// One 10 s throttle shared by the "ignored control message" and
+    /// "no P2P handler" warnings (#13).
+    log_throttle: LogThrottle,
     shutdown_notify: Notify,
     tunnels: Mutex<TunnelManager>,
     bg_tasks: Mutex<JoinSet<()>>,
@@ -125,6 +139,10 @@ impl Control {
             data_tx,
             data_rx: Mutex::new(data_rx),
             data_notify: Notify::new(),
+            waiting_visitors: std::sync::Mutex::new(HashMap::new()),
+            outstanding_data_conns: AtomicUsize::new(0),
+            unexpected_messages: AtomicUsize::new(0),
+            log_throttle: LogThrottle::new(Duration::from_secs(10)),
             shutdown_notify: Notify::new(),
             tunnels: Mutex::new(TunnelManager::new()),
             bg_tasks: Mutex::new(JoinSet::new()),
@@ -161,6 +179,12 @@ impl Control {
     /// Hex-encoded session secret issued at login (#11).
     pub fn session_secret(&self) -> &str {
         &self.session_secret
+    }
+
+    /// Joined-connection idle timeout from `[limits]` (#13): `None`
+    /// when `idleTimeoutSecs` is 0 (disabled).
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.cfg.limits.idle_timeout()
     }
 
     /// Current access policy (live: reloads apply immediately, #11).
@@ -295,13 +319,28 @@ impl Control {
                         if let Err(e) = handler(p2p_msg, sid, peer).await {
                             tracing::warn!(error = %e, "P2P broker dispatch error");
                         }
-                    } else {
+                    } else if self.log_throttle.should_log() {
                         tracing::warn!("P2P message received but no handler registered");
                     }
                 }
 
                 other => {
-                    tracing::warn!(ty = other.type_byte(), "ignored control message");
+                    let n = self
+                        .unexpected_messages
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
+                    if self.log_throttle.should_log() {
+                        tracing::warn!(ty = other.type_byte(), "ignored control message");
+                    }
+                    if n > 10 {
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            "too many unexpected control messages; disconnecting"
+                        );
+                        self.metrics.inc_limit_reject("unexpected_message");
+                        self.shutdown().await;
+                        break;
+                    }
                 }
             }
         }

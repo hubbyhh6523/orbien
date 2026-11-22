@@ -83,18 +83,28 @@ impl TunnelManager {
         self.tunnels
             .iter()
             .map(|(name, entry)| {
-                let (tunnel_type, remote_addr) = match &entry.tunnel {
-                    RegisteredTunnel::Tcp(t) => ("tcp".into(), format!(":{}", t.remote_port)),
-                    RegisteredTunnel::Http(h) => ("http".into(), h.domains.join(",")),
-                    RegisteredTunnel::Https(h) => ("https".into(), h.domains.join(",")),
-                    RegisteredTunnel::Udp(u) => ("udp".into(), format!(":{}", u.remote_port)),
+                let (tunnel_type, remote_addr, status) = match &entry.tunnel {
+                    RegisteredTunnel::Tcp(t) => (
+                        "tcp".into(),
+                        format!(":{}", t.remote_port),
+                        t.status().to_string(),
+                    ),
+                    RegisteredTunnel::Http(h) => {
+                        ("http".into(), h.domains.join(","), "online".into())
+                    }
+                    RegisteredTunnel::Https(h) => {
+                        ("https".into(), h.domains.join(","), "online".into())
+                    }
+                    RegisteredTunnel::Udp(u) => {
+                        ("udp".into(), format!(":{}", u.remote_port), "online".into())
+                    }
                 };
                 TunnelSummary {
                     name: name.clone(),
                     tunnel_type,
                     remote_addr,
                     local_addr: entry.local_addr.clone(),
-                    status: "online".into(),
+                    status,
                 }
             })
             .collect()

@@ -77,3 +77,65 @@ listener and UDP ports, absence of a connection to a reachable local peer,
 non-resolvable hosts for every transport, and absence of TOFU writes. Each CLI
 invocation has a 10-second timeout; certificate generation has a 30-second
 limit. Python 3.11+ and OpenSSL are required for this script.
+
+## [limits]
+
+The server `[limits]` table bounds what an unauthenticated connection can
+consume before it logs in, and what idle joined connections may hold. All
+keys are optional; the defaults below apply when the table is absent. Unknown
+keys are rejected. A commented example with these defaults lives in
+`conf/orbien-server-full.toml`.
+
+- `preLoginTimeoutSecs` (default 10, must be > 0): deadline from accept to
+  login. It covers the peek, the WebSocket upgrade and the TLS handshake,
+  the first control message, and a yamux session or QUIC connection that
+  never logs in. A peer that connects and sends nothing, or a byte at a
+  time, is cut off at this deadline.
+- `idleTimeoutSecs` (default 3600, 0 disables): a joined TCP/HTTPS
+  connection or HTTP exchange with no bytes flowing for this long is
+  aborted. The HTTP 300 s absolute exchange deadline is unchanged; the
+  two run together and whichever fires first wins. Setting this to 0
+  produces a risk warning in `--check-config` (idle connections are then
+  unbounded).
+- `firstMessageMaxBytes` (default 4096, must be > 0): the first control
+  message (Login or NewDataConn) may not exceed this; the length is
+  checked before the body is allocated, so a peer that declares a huge
+  body and stalls is rejected from the header alone. Later messages use
+  per-type limits: 1 KiB for Ping/Pong/KickOut/CloseTunnel/NewTunnelResp/
+  LoginResp/StartDataConn/ReqDataConn/P2p*, 4 KiB for Login/NewDataConn,
+  64 KiB for NewTunnel, 256 KiB for UdpPacket.
+- `preLoginMaxConns` (default 512, must be > 0) and
+  `preLoginMaxConnsPerIp` (default 32, must be > 0): how many
+  not-yet-logged-in connections the server holds, globally and per client
+  IP. Over the cap the connection is closed at once. A successful login
+  releases the slot.
+- `maxWaitingVisitorsPerTunnel` (default 32, must be > 0): visitors
+  waiting for a data connection on one tunnel. Over the cap a visitor is
+  refused immediately instead of queueing up to 10 s.
+- `maxOutstandingDataConns` (default 8, may be 0): how many `ReqDataConn`
+  requests may be outstanding per session above `poolCount`. The client
+  likewise ignores `ReqDataConn` above `poolCount + 8`.
+- `poolIdleTtlSecs` (default 300, must be > 0): a pooled data stream idle
+  longer than this is dropped instead of being handed to a visitor.
+
+QUIC defaults changed with the same release: `maxIncomingStreams` 1000
+(was 100000), stream receive window 1 MiB (was 32 MiB), connection receive
+window 8 MiB (was 64 MiB), send window 8 MiB (was 64 MiB). The old values
+are still reachable through `[transport.quic]`. QUIC address validation
+(Retry) is not enabled: quinn 0.11 exposes no public switch for it.
+
+Supervisor behavior change: an accept failure (for example EMFILE) no
+longer exits the server. The listener logs at most once per 10 s, backs
+off exponentially (10 ms, doubling, capped at 1 s) and retries, and a
+listener that exits on its own is now an error instead of a silent
+success. Deployments that relied on the process exiting to trigger a
+restart should keep their restart policy anyway (the process still exits
+on a genuinely fatal error), but they must not assume a listener failure
+restarts it.
+
+Rejections are counted per reason in the server snapshot
+(`limit_rejections`): `pre_login_timeout`, `first_message_too_large`,
+`pre_login_cap`, `waiting_visitors`, `idle_timeout`,
+`unexpected_message`. A session that sends more than 10 unknown control
+messages is disconnected; the accept-error, ignored-message and
+P2P-no-handler logs are each rate-limited to one line per 10 s.

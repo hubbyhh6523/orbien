@@ -152,9 +152,7 @@ pub async fn build_connector(cfg: &ClientConfig) -> Result<Arc<dyn Connector>> {
             let session = QuicSession::dial(
                 addr,
                 &cfg.tls_server_name(),
-                cfg.transport.quic.keepalive(),
-                cfg.transport.quic.idle_timeout(),
-                cfg.transport.quic.max_incoming_streams,
+                &cfg.transport.quic,
                 &t.cert_file,
                 &t.key_file,
                 &t.trusted_ca_file,

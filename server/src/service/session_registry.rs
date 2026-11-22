@@ -1,4 +1,4 @@
-use super::{OfflineClientRecord, Service};
+use super::{pre_login::PreLoginSlot, OfflineClientRecord, Service};
 use crate::control::{validate, Control, P2pHandler};
 use crate::metrics::ServerMetrics;
 use crate::sanitize::sanitize_for_logging;
@@ -26,6 +26,7 @@ impl Service {
         stream: DynStream,
         login: Login,
         peer: SocketAddr,
+        pre_login: PreLoginSlot,
     ) -> Result<()> {
         // #11: match the digest against the global token AND every policy
         // token, and remember which one matched (as a token id, never the
@@ -200,6 +201,12 @@ impl Service {
 
         self.metrics.new_client(&session_id);
 
+        // #13: logged in — release the pre-login slot. The session no
+        // longer counts against the unauthenticated caps, and the
+        // pre-login deadline watchdog (yamux select / QUIC task) sees the
+        // empty slot and stands down.
+        pre_login.lock().await.take();
+
         let controls = Arc::clone(&self.controls);
         let metrics = Arc::clone(&self.metrics);
         let rid = session_id.clone();
@@ -239,6 +246,7 @@ impl Service {
         self: Arc<Self>,
         stream: DynStream,
         nw: NewDataConn,
+        pre_login: PreLoginSlot,
     ) -> Result<()> {
         if nw.session_id.trim().is_empty() {
             return Err(anyhow!("empty session_id for data conn"));
@@ -292,6 +300,8 @@ impl Service {
                 nw.session_id
             ));
         }
+        // #13: proven data connection — release the pre-login slot.
+        pre_login.lock().await.take();
         Ok(())
     }
 }

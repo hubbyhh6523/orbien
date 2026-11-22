@@ -189,12 +189,16 @@ pub async fn run_https_gw_listener(
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "https gateway listener ready (SNI mux, no TLS terminate)");
 
+    // #13: an accept error backs off and retries; it no longer ends
+    // the listener (and, via Service::run, the whole server).
+    let mut backoff = crate::accept::AcceptBackoff::new();
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        backoff.reset();
                         orbien_core::net::enable_nodelay(&stream);
                         let gw = Arc::clone(&gw);
                         // Snapshot current policy; hot-reload swaps this on the next connection.
@@ -206,8 +210,7 @@ pub async fn run_https_gw_listener(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "https gateway accept failed");
-                        break;
+                        backoff.on_error(&e.into()).await;
                     }
                 }
             }
@@ -239,7 +242,7 @@ async fn handle_https_ingress(
         return Err(anyhow!("https tunnel client gone: {}", route.tunnel_name));
     };
 
-    let data = control.get_data_conn().await?;
+    let data = control.get_data_conn(&route.tunnel_name).await?;
     let data = control
         .start_data_conn(
             data,
@@ -264,7 +267,15 @@ async fn handle_https_ingress(
         source = %ingress.source,
         "https joining ingress <-> data (passthrough)"
     );
-    let _ =
-        metrics::join_and_record(&control.metrics, &route.tunnel_name, "https", user, data).await;
+    let idle_timeout = control.idle_timeout();
+    let _ = metrics::join_and_record_idle(
+        &control.metrics,
+        &route.tunnel_name,
+        "https",
+        user,
+        data,
+        idle_timeout,
+    )
+    .await;
     Ok(())
 }

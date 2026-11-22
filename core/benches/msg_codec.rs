@@ -26,6 +26,7 @@ fn sample_message(kind: &str) -> Message {
             timestamp: 0,
             session_id: "bench-session".into(),
             pool_count: 0,
+            resume_proof: String::new(),
         }),
         "ping" => Message::Ping(Ping {
             auth_digest: String::new(),
