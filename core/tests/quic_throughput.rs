@@ -5,12 +5,18 @@
 //! (1_000 streams, 1/8/8 MiB) and prints both timings, so a regression
 //! from the lowered defaults shows up here and in CI.
 //!
-//! The sender paces itself (2 ms per MiB): without pacing, the initial
+//! The sender paces itself (10 ms per MiB): without pacing, the initial
 //! burst on Windows loopback drops UDP datagrams, the receiver's
 //! reassembly buffer overflows quinn's 1024-chunk cap ("too many gaps
 //! in stream buffer") and the peer aborts the connection. 32 MiB is
 //! still 32x the new 1 MiB stream window, so the window comparison
 //! still shows.
+//!
+//! Each transfer prints its label, bytes written/received, elapsed
+//! time, and the connection's path stats (RTT, congestion window,
+//! packets sent/lost, congestion events), so a CI failure shows
+//! exactly which leg died, how far it got, and whether the path was
+//! actually losing packets — instead of just the bare error.
 //!
 //! The sandbox blocks UDP sendto (EPERM, even loopback), so the test
 //! probes for that first and skips cleanly with a message instead of
@@ -28,7 +34,7 @@ use std::time::{Duration, Instant};
 const TRANSFER_BYTES: usize = 32 * 1024 * 1024;
 /// Pause the sender this long per MiB written, so bursts stay small
 /// enough for the receiver's UDP socket buffer to absorb.
-const PACE_PER_MIB: Duration = Duration::from_millis(2);
+const PACE_PER_MIB: Duration = Duration::from_millis(10);
 
 /// True when this machine cannot send UDP at all (sandbox EPERM).
 fn udp_blocked() -> bool {
@@ -64,8 +70,17 @@ fn write_pem_files(dir: &Path) -> Result<(String, String)> {
     ))
 }
 
-async fn transfer(quic: &QuicOptions, cert: &str, key: &str) -> Result<Duration> {
-    let server = build_server_endpoint("127.0.0.1:0".parse()?, quic, cert, key, "")?;
+/// One leg of the smoke test. Prints its label, byte counts, elapsed
+/// time, and the connection's path stats on success and on failure,
+/// so a CI failure names the dying leg and shows whether the path was
+/// actually losing packets.
+async fn transfer(quic: &QuicOptions, cert: &str, key: &str, label: &str) -> Result<Duration> {
+    eprintln!(
+        "[{label}] starting {} MiB transfer",
+        TRANSFER_BYTES / (1024 * 1024)
+    );
+    let server = build_server_endpoint("127.0.0.1:0".parse()?, quic, cert, key, "")
+        .with_context(|| format!("[{label}] server endpoint"))?;
     let addr = server.local_addr()?;
     let server_task = tokio::spawn(async move {
         let incoming = server.accept().await.ok_or_else(|| anyhow!("no incoming"))?;
@@ -79,41 +94,71 @@ async fn transfer(quic: &QuicOptions, cert: &str, key: &str) -> Result<Duration>
         Ok::<u64, anyhow::Error>(total)
     });
 
-    let client = build_client_endpoint(quic, "", "", "", None)?;
+    let client = build_client_endpoint(quic, "", "", "", None)
+        .with_context(|| format!("[{label}] client endpoint"))?;
     let start = Instant::now();
     let conn = client
         .connect(addr, "localhost")
-        .context("client connect")?
+        .with_context(|| format!("[{label}] client connect"))?
         .await
-        .context("client handshake")?;
-    let (mut send, _recv) = conn.open_bi().await.context("open_bi")?;
+        .with_context(|| format!("[{label}] client handshake"))?;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .with_context(|| format!("[{label}] open_bi"))?;
     let chunk = vec![0xabu8; 64 * 1024];
     let mut left = TRANSFER_BYTES;
+    let mut written: u64 = 0;
     let mut since_pace = 0usize;
     while left > 0 {
         let n = left.min(chunk.len());
-        send.write_all(&chunk[..n]).await.context("client write")?;
+        if let Err(e) = send.write_all(&chunk[..n]).await {
+            let s = conn.stats();
+            eprintln!(
+                "[{label}] client write failed after {written} bytes: {e:?}; \
+                 path stats: rtt={:?} cwnd={} sent_packets={} lost_packets={} lost_bytes={} congestion_events={}",
+                s.path.rtt, s.path.cwnd, s.path.sent_packets, s.path.lost_packets,
+                s.path.lost_bytes, s.path.congestion_events,
+            );
+            return Err(e).context(format!("[{label}] client write after {written} bytes"));
+        }
         left -= n;
+        written += n as u64;
         since_pace += n;
         if since_pace >= 1024 * 1024 {
             since_pace = 0;
             tokio::time::sleep(PACE_PER_MIB).await;
         }
     }
-    send.finish().context("client finish")?;
+    send.finish()
+        .with_context(|| format!("[{label}] client finish after {written} bytes"))?;
     let elapsed = start.elapsed();
-    let total = server_task.await.context("server task")??;
-    assert_eq!(total, TRANSFER_BYTES as u64, "server received short transfer");
+    let total = server_task
+        .await
+        .with_context(|| format!("[{label}] server task after {written} bytes"))?
+        .with_context(|| format!("[{label}] server transfer after {written} bytes"))?;
+    let s = conn.stats();
+    eprintln!(
+        "[{label}] done: wrote {written}, server got {total}, elapsed {elapsed:?}; \
+         path stats: rtt={:?} cwnd={} sent_packets={} lost_packets={} lost_bytes={} congestion_events={}",
+        s.path.rtt, s.path.cwnd, s.path.sent_packets, s.path.lost_packets,
+        s.path.lost_bytes, s.path.congestion_events,
+    );
+    assert_eq!(
+        total, TRANSFER_BYTES as u64,
+        "[{label}] server received short transfer"
+    );
     Ok(elapsed)
 }
 
 fn old_defaults() -> QuicOptions {
-    let mut q = QuicOptions::default();
-    q.max_incoming_streams = 100_000;
-    q.stream_recv_window = 32 * 1024 * 1024;
-    q.conn_recv_window = 64 * 1024 * 1024;
-    q.send_window = 64 * 1024 * 1024;
-    q
+    QuicOptions {
+        max_incoming_streams: 100_000,
+        stream_recv_window: 32 * 1024 * 1024,
+        conn_recv_window: 64 * 1024 * 1024,
+        send_window: 64 * 1024 * 1024,
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -129,13 +174,13 @@ async fn quic_throughput_old_vs_new_defaults() {
     let run = async {
         let old = tokio::time::timeout(
             Duration::from_secs(120),
-            transfer(&old_defaults(), &cert, &key),
+            transfer(&old_defaults(), &cert, &key, "old"),
         )
         .await
         .context("old-defaults transfer timed out")??;
         let new = tokio::time::timeout(
             Duration::from_secs(120),
-            transfer(&QuicOptions::default(), &cert, &key),
+            transfer(&QuicOptions::default(), &cert, &key, "new"),
         )
         .await
         .context("new-defaults transfer timed out")??;
