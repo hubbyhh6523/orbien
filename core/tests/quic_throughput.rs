@@ -172,22 +172,41 @@ async fn quic_throughput_old_vs_new_defaults() {
     std::fs::create_dir_all(&dir).unwrap();
     let (cert, key) = write_pem_files(&dir).unwrap();
     let run = async {
-        let old = tokio::time::timeout(
-            Duration::from_secs(120),
-            transfer(&old_defaults(), &cert, &key, "old"),
-        )
-        .await
-        .context("old-defaults transfer timed out")??;
+        // Windows loopback cannot reassemble the old leg: its 32 MiB
+        // window lets the client flood ~27k packets and the server's
+        // reassembly buffer overflows quinn's 1024-chunk cap, aborting
+        // the connection (seen twice on Windows CI; the client had
+        // written all 32 MiB when the server died). The new leg's 1 MiB
+        // window caps in-flight data at ~850 packets, so it cannot hit
+        // that cap. The old-vs-new comparison still runs on Linux CI.
+        let old = if cfg!(target_os = "windows") {
+            None
+        } else {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(120),
+                    transfer(&old_defaults(), &cert, &key, "old"),
+                )
+                .await
+                .context("old-defaults transfer timed out")??,
+            )
+        };
         let new = tokio::time::timeout(
             Duration::from_secs(120),
             transfer(&QuicOptions::default(), &cert, &key, "new"),
         )
         .await
         .context("new-defaults transfer timed out")??;
-        println!(
-            "QUIC loopback {} MiB: old defaults {old:?}, new defaults {new:?}",
-            TRANSFER_BYTES / (1024 * 1024)
-        );
+        match old {
+            Some(old) => println!(
+                "QUIC loopback {} MiB: old defaults {old:?}, new defaults {new:?}",
+                TRANSFER_BYTES / (1024 * 1024)
+            ),
+            None => println!(
+                "QUIC loopback {} MiB: new defaults {new:?} (old leg skipped on Windows)",
+                TRANSFER_BYTES / (1024 * 1024)
+            ),
+        }
         Ok::<(), anyhow::Error>(())
     };
     let result = run.await;
