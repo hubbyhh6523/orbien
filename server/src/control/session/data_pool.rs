@@ -37,11 +37,22 @@ impl Control {
     pub async fn push_data_conn(&self, stream: DynStream) -> bool {
         // Saturating: a stream can arrive without a matching claim
         // (stale client, test setup); never let the counter wrap.
-        let _ = self.outstanding_data_conns.try_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |x| Some(x.saturating_sub(1)),
-        );
+        // Plain CAS loop, not `fetch_update`/`try_update`: the former
+        // is deprecated, the latter is still unstable on the CI
+        // toolchain (Rust 1.92, E0658).
+        let mut cur = self.outstanding_data_conns.load(Ordering::SeqCst);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.outstanding_data_conns.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
         if self.data_tx.try_send((stream, Instant::now())).is_ok() {
             self.data_notify.notify_waiters();
             true
