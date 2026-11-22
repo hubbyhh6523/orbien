@@ -27,9 +27,19 @@ pub enum MessageWriteError {
 
 const MAX_MSG_SIZE: u32 = 256 * 1024;
 
-/// Default timeout applied when using [`read_msg_timeout`].
-#[allow(dead_code)]
-pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-type body limit (#13). Login and NewDataConn carry a handful of
+/// short strings; Ping/Pong and the other small control messages are a
+/// few dozen bytes; NewTunnel carries bounded domain/location lists
+/// (#11 caps: 32 each, strings ≤ 64 chars). UdpPacket keeps the global
+/// cap because its base64 JSON body can legitimately approach it.
+pub fn max_bytes_for_type(type_byte: u8) -> u32 {
+    match type_byte {
+        TYPE_LOGIN | TYPE_NEW_DATA_CONN => 4 * 1024,
+        TYPE_NEW_TUNNEL => 64 * 1024,
+        TYPE_UDP_PACKET => MAX_MSG_SIZE,
+        _ => 1024,
+    }
+}
 
 pub async fn write_msg<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -63,9 +73,40 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(
 }
 
 pub async fn read_msg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, MessageReadError> {
+    read_msg_with_limits(reader, max_bytes_for_type).await
+}
+
+/// Like [`read_msg`] but with one size limit for every message type
+/// (used for the first message of a connection, before login).
+pub async fn read_msg_limited<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: u32,
+) -> Result<Message, MessageReadError> {
+    read_msg_with_limits(reader, |_| max_size).await
+}
+
+/// Like [`read_msg_limited`] but fails with [`MessageReadError::Timeout`]
+/// if the full message is not received within `timeout`.
+pub async fn read_msg_limited_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: u32,
+    timeout: Duration,
+) -> Result<Message, MessageReadError> {
+    tokio::time::timeout(timeout, read_msg_limited(reader, max_size))
+        .await
+        .unwrap_or(Err(MessageReadError::Timeout(timeout)))
+}
+
+/// Core reader: the length is checked against `limit(type_byte)` *before*
+/// the body buffer is allocated, so a peer that declares a huge body and
+/// then stalls is rejected immediately instead of hanging the reader.
+pub async fn read_msg_with_limits<R: AsyncRead + Unpin, F: Fn(u8) -> u32>(
+    reader: &mut R,
+    limit: F,
+) -> Result<Message, MessageReadError> {
     let type_byte = reader.read_u8().await?;
     let len = reader.read_u32_le().await?;
-    if len > MAX_MSG_SIZE {
+    if len > limit(type_byte) {
         return Err(MessageReadError::TooLarge(len));
     }
     let mut buf = vec![0u8; len as usize];
@@ -91,18 +132,6 @@ pub async fn read_msg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, M
         other => return Err(MessageReadError::UnknownType(other)),
     };
     Ok(msg)
-}
-
-/// Like [`read_msg`] but fails with [`MessageReadError::Timeout`] if the
-/// full message is not received within `timeout`.
-#[allow(dead_code)]
-pub async fn read_msg_timeout<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    timeout: Duration,
-) -> Result<Message, MessageReadError> {
-    tokio::time::timeout(timeout, read_msg(reader))
-        .await
-        .unwrap_or(Err(MessageReadError::Timeout(timeout)))
 }
 
 #[cfg(test)]
@@ -267,5 +296,136 @@ mod tests {
         a.flush().await.unwrap();
         let err = read_msg(&mut b).await.unwrap_err();
         assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: per-type limits. A Login body over 4 KiB must be rejected
+    /// even though it is far under the 256 KiB global cap.
+    #[tokio::test]
+    async fn login_over_4k_rejected() {
+        let (mut a, mut b) = duplex(8192);
+        let body = vec![b'x'; 4097];
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = a.write_u8(TYPE_LOGIN).await;
+            let _ = a.write_u32_le(4097).await;
+            let _ = a.write_all(&body).await;
+            let _ = a.flush().await;
+        });
+        let err = read_msg(&mut b).await.unwrap_err();
+        assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: Ping/Pong are a few dozen bytes in normal use; 1 KiB is plenty.
+    #[tokio::test]
+    async fn ping_over_1k_rejected() {
+        let (mut a, mut b) = duplex(8192);
+        let body = vec![b'x'; 1025];
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = a.write_u8(TYPE_PING).await;
+            let _ = a.write_u32_le(1025).await;
+            let _ = a.write_all(&body).await;
+            let _ = a.flush().await;
+        });
+        let err = read_msg(&mut b).await.unwrap_err();
+        assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: NewTunnel is the largest small message; 64 KiB is its cap.
+    #[tokio::test]
+    async fn new_tunnel_over_64k_rejected() {
+        let (mut a, mut b) = duplex(128 * 1024);
+        let body = vec![b'x'; 65_537];
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = a.write_u8(TYPE_NEW_TUNNEL).await;
+            let _ = a.write_u32_le(65_537).await;
+            let _ = a.write_all(&body).await;
+            let _ = a.flush().await;
+        });
+        let err = read_msg(&mut b).await.unwrap_err();
+        assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: an over-limit first message must be rejected from the header
+    /// alone, before the body is allocated or waited for. A peer that
+    /// declares the body and then stalls must not hang the reader.
+    #[tokio::test]
+    async fn first_message_over_limit_rejected_before_body() {
+        let (mut a, mut b) = duplex(64);
+        use tokio::io::AsyncWriteExt;
+        a.write_u8(TYPE_LOGIN).await.unwrap();
+        a.write_u32_le(5000).await.unwrap();
+        a.flush().await.unwrap();
+        // No body is ever sent. If the reader waits for it, this times out.
+        let res = tokio::time::timeout(Duration::from_millis(500), read_msg(&mut b)).await;
+        let err = res
+            .expect("read_msg hung waiting for a body it must reject before allocating")
+            .unwrap_err();
+        assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: the per-type table itself, so a future type added to the
+    /// protocol cannot silently fall through to the wrong limit.
+    #[test]
+    fn per_type_limit_table() {
+        assert_eq!(max_bytes_for_type(TYPE_LOGIN), 4 * 1024);
+        assert_eq!(max_bytes_for_type(TYPE_NEW_DATA_CONN), 4 * 1024);
+        assert_eq!(max_bytes_for_type(TYPE_NEW_TUNNEL), 64 * 1024);
+        assert_eq!(max_bytes_for_type(TYPE_UDP_PACKET), MAX_MSG_SIZE);
+        for t in [
+            TYPE_LOGIN_RESP,
+            TYPE_NEW_TUNNEL_RESP,
+            TYPE_CLOSE_TUNNEL,
+            TYPE_REQ_DATA_CONN,
+            TYPE_START_DATA_CONN,
+            TYPE_PING,
+            TYPE_PONG,
+            TYPE_KICK_OUT,
+            TYPE_P2P_REQ,
+            TYPE_P2P_INFO,
+            TYPE_P2P_ADDR,
+            TYPE_P2P_READY,
+        ] {
+            assert_eq!(max_bytes_for_type(t), 1024, "type {t}");
+        }
+    }
+
+    /// #13: UdpPacket keeps the 256 KiB cap — a large (100 KiB payload,
+    /// ~134 KiB base64 JSON) packet still roundtrips. The duplex buffer
+    /// must hold the whole body: the shared `roundtrip` helper writes
+    /// before reading, which deadlocks above its 4 KiB buffer.
+    #[tokio::test]
+    async fn udp_packet_large_roundtrip() {
+        let (mut a, mut b) = duplex(256 * 1024);
+        let msg = Message::UdpPacket(UdpPacket::new(vec![0xabu8; 100_000], None));
+        write_msg(&mut a, &msg).await.unwrap();
+        let got = read_msg(&mut b).await.unwrap();
+        assert_eq!(got.type_byte(), msg.type_byte());
+        let (_, body) = split(&msg);
+        let (_, got_body) = split(&got);
+        assert_eq!(body, got_body);
+    }
+
+    #[tokio::test]
+    async fn udp_packet_over_256k_rejected() {
+        let (mut a, mut b) = duplex(64);
+        use tokio::io::AsyncWriteExt;
+        a.write_u8(TYPE_UDP_PACKET).await.unwrap();
+        a.write_u32_le(MAX_MSG_SIZE + 1).await.unwrap();
+        a.flush().await.unwrap();
+        let err = read_msg(&mut b).await.unwrap_err();
+        assert!(matches!(err, MessageReadError::TooLarge(_)));
+    }
+
+    /// #13: the limited+timeout reader fails with Timeout when the peer
+    /// sends nothing, and honours the size limit before the body.
+    #[tokio::test]
+    async fn read_msg_limited_timeout_times_out() {
+        let (_a, mut b) = duplex(64);
+        let err = read_msg_limited_timeout(&mut b, 4096, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageReadError::Timeout(_)));
     }
 }

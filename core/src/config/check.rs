@@ -56,6 +56,11 @@ impl ServerConfig {
             }
             secret_warning(&mut out, "dashboard.password", &self.dashboard.password);
         }
+        // #13: idleTimeoutSecs == 0 is a deliberate opt-out, but joined
+        // connections then have no idle protection at all.
+        if self.limits.idle_timeout_secs == 0 {
+            out.push("[no-idle-timeout] limits.idleTimeoutSecs is 0; joined connections have no idle timeout".into());
+        }
         out
     }
 }

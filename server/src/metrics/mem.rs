@@ -31,6 +31,10 @@ pub struct ServerSnapshot {
     pub client_counts: usize,
     pub total_client_counts: usize,
     pub tunnel_type_counts: HashMap<String, usize>,
+    /// Rejections by the #13 limits, keyed by the fixed reason set:
+    /// pre_login_timeout, first_message_too_large, pre_login_cap,
+    /// waiting_visitors, idle_timeout, unexpected_message.
+    pub limit_rejections: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +113,7 @@ struct State {
     seen_clients: HashSet<String>,
     tunnel_type_counts: HashMap<String, Counter>,
     tunnels: HashMap<String, TunnelStats>,
+    limit_rejections: HashMap<&'static str, u64>,
 }
 
 pub struct MemMetrics {
@@ -129,8 +134,16 @@ impl MemMetrics {
                 seen_clients: HashSet::new(),
                 tunnel_type_counts: HashMap::new(),
                 tunnels: HashMap::new(),
+                limit_rejections: HashMap::new(),
             }),
         })
+    }
+
+    /// Count one rejection by a #13 limit. `reason` must be one of the
+    /// fixed reasons listed on [`ServerSnapshot::limit_rejections`].
+    pub fn inc_limit_reject(&self, reason: &'static str) {
+        let mut g = self.state.lock().expect("metrics lock");
+        *g.limit_rejections.entry(reason).or_insert(0) += 1;
     }
 
     pub fn server_snapshot(&self) -> ServerSnapshot {
@@ -149,6 +162,11 @@ impl MemMetrics {
             client_counts: g.client_counts.count().max(0) as usize,
             total_client_counts: g.seen_clients.len(),
             tunnel_type_counts,
+            limit_rejections: g
+                .limit_rejections
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
         }
     }
 

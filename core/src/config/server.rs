@@ -97,6 +97,108 @@ pub struct ServerConfig {
         alias = "ctrl_heartbeat_timeout_secs"
     )]
     pub ctrl_heartbeat_timeout_secs: u64,
+
+    /// Pre-login and visitor resource limits (#13). All defaults are the
+    /// approved values; every field is optional in the file.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// Pre-login and visitor resource limits (#13).
+///
+/// `max_outstanding_data_conns` is the burst *above* the session pool size:
+/// the outstanding-`ReqDataConn` cap is `pool_count + burst`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    #[serde(
+        default = "default_pre_login_timeout",
+        rename = "preLoginTimeoutSecs",
+        alias = "pre_login_timeout_secs"
+    )]
+    pub pre_login_timeout_secs: u64,
+
+    #[serde(
+        default = "default_idle_timeout",
+        rename = "idleTimeoutSecs",
+        alias = "idle_timeout_secs"
+    )]
+    pub idle_timeout_secs: u64,
+
+    #[serde(
+        default = "default_first_message_max_bytes",
+        rename = "firstMessageMaxBytes",
+        alias = "first_message_max_bytes"
+    )]
+    pub first_message_max_bytes: u32,
+
+    #[serde(
+        default = "default_pre_login_max_conns",
+        rename = "preLoginMaxConns",
+        alias = "pre_login_max_conns"
+    )]
+    pub pre_login_max_conns: usize,
+
+    #[serde(
+        default = "default_pre_login_max_conns_per_ip",
+        rename = "preLoginMaxConnsPerIp",
+        alias = "pre_login_max_conns_per_ip"
+    )]
+    pub pre_login_max_conns_per_ip: usize,
+
+    #[serde(
+        default = "default_max_waiting_visitors",
+        rename = "maxWaitingVisitorsPerTunnel",
+        alias = "max_waiting_visitors_per_tunnel"
+    )]
+    pub max_waiting_visitors_per_tunnel: usize,
+
+    #[serde(
+        default = "default_max_outstanding_data_conns",
+        rename = "maxOutstandingDataConns",
+        alias = "max_outstanding_data_conns"
+    )]
+    pub max_outstanding_data_conns: usize,
+
+    #[serde(
+        default = "default_pool_idle_ttl",
+        rename = "poolIdleTtlSecs",
+        alias = "pool_idle_ttl_secs"
+    )]
+    pub pool_idle_ttl_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            pre_login_timeout_secs: default_pre_login_timeout(),
+            idle_timeout_secs: default_idle_timeout(),
+            first_message_max_bytes: default_first_message_max_bytes(),
+            pre_login_max_conns: default_pre_login_max_conns(),
+            pre_login_max_conns_per_ip: default_pre_login_max_conns_per_ip(),
+            max_waiting_visitors_per_tunnel: default_max_waiting_visitors(),
+            max_outstanding_data_conns: default_max_outstanding_data_conns(),
+            pool_idle_ttl_secs: default_pool_idle_ttl(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    pub fn pre_login_timeout(&self) -> Duration {
+        Duration::from_secs(self.pre_login_timeout_secs.max(1))
+    }
+
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        if self.idle_timeout_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.idle_timeout_secs))
+        }
+    }
+
+    pub fn pool_idle_ttl(&self) -> Duration {
+        Duration::from_secs(self.pool_idle_ttl_secs.max(1))
+    }
 }
 
 /// Per-token access policy entry.
@@ -281,6 +383,24 @@ pub struct QuicOptions {
         alias = "max_incoming_streams"
     )]
     pub max_incoming_streams: u32,
+    #[serde(
+        default = "default_quic_stream_recv_window",
+        rename = "streamRecvWindow",
+        alias = "stream_recv_window"
+    )]
+    pub stream_recv_window: u32,
+    #[serde(
+        default = "default_quic_conn_recv_window",
+        rename = "connRecvWindow",
+        alias = "conn_recv_window"
+    )]
+    pub conn_recv_window: u32,
+    #[serde(
+        default = "default_quic_send_window",
+        rename = "sendWindow",
+        alias = "send_window"
+    )]
+    pub send_window: u64,
 }
 
 impl Default for QuicOptions {
@@ -289,6 +409,9 @@ impl Default for QuicOptions {
             keepalive_period: default_quic_keepalive(),
             max_idle_timeout: default_quic_idle(),
             max_incoming_streams: default_quic_streams(),
+            stream_recv_window: default_quic_stream_recv_window(),
+            conn_recv_window: default_quic_conn_recv_window(),
+            send_window: default_quic_send_window(),
         }
     }
 }
@@ -327,7 +450,40 @@ fn default_quic_idle() -> u64 {
     30
 }
 fn default_quic_streams() -> u32 {
-    100_000
+    1_000
+}
+fn default_quic_stream_recv_window() -> u32 {
+    1024 * 1024
+}
+fn default_quic_conn_recv_window() -> u32 {
+    8 * 1024 * 1024
+}
+fn default_quic_send_window() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_pre_login_timeout() -> u64 {
+    10
+}
+fn default_idle_timeout() -> u64 {
+    3600
+}
+fn default_first_message_max_bytes() -> u32 {
+    4096
+}
+fn default_pre_login_max_conns() -> usize {
+    512
+}
+fn default_pre_login_max_conns_per_ip() -> usize {
+    32
+}
+fn default_max_waiting_visitors() -> usize {
+    32
+}
+fn default_max_outstanding_data_conns() -> usize {
+    8
+}
+fn default_pool_idle_ttl() -> u64 {
+    300
 }
 fn default_udp_packet_size() -> usize {
     1500
@@ -409,6 +565,7 @@ impl Default for ServerConfig {
             single_client_per_user: false,
             ctrl_heartbeat_interval_secs: 0,
             ctrl_heartbeat_timeout_secs: 0,
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -556,6 +713,40 @@ impl ServerConfig {
         }
 
         self.dashboard.validate()?;
+
+        // #13: a zero cap or window would refuse everything (or break
+        // QUIC outright); idleTimeoutSecs == 0 is the one deliberate
+        // opt-out and means "no idle timeout". The burst above the pool
+        // size may be 0 (cap is then exactly pool_count).
+        let limits = &self.limits;
+        if limits.pre_login_timeout_secs == 0 {
+            anyhow::bail!("limits.preLoginTimeoutSecs must be > 0");
+        }
+        if limits.first_message_max_bytes == 0 {
+            anyhow::bail!("limits.firstMessageMaxBytes must be > 0");
+        }
+        if limits.pre_login_max_conns == 0 {
+            anyhow::bail!("limits.preLoginMaxConns must be > 0");
+        }
+        if limits.pre_login_max_conns_per_ip == 0 {
+            anyhow::bail!("limits.preLoginMaxConnsPerIp must be > 0");
+        }
+        if limits.max_waiting_visitors_per_tunnel == 0 {
+            anyhow::bail!("limits.maxWaitingVisitorsPerTunnel must be > 0");
+        }
+        if limits.pool_idle_ttl_secs == 0 {
+            anyhow::bail!("limits.poolIdleTtlSecs must be > 0");
+        }
+        let quic = &self.transport.quic;
+        if quic.stream_recv_window == 0 {
+            anyhow::bail!("transport.quic.streamRecvWindow must be > 0");
+        }
+        if quic.conn_recv_window == 0 {
+            anyhow::bail!("transport.quic.connRecvWindow must be > 0");
+        }
+        if quic.send_window == 0 {
+            anyhow::bail!("transport.quic.sendWindow must be > 0");
+        }
 
         Ok(())
     }

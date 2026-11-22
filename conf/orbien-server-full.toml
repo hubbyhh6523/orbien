@@ -38,7 +38,25 @@ heartbeatTimeout = 90
 [transport.quic]
 keepalivePeriod = 10
 maxIdleTimeout = 30
-maxIncomingStreams = 100000
+maxIncomingStreams = 1000
+# QUIC flow-control windows in bytes (#13). Lower values bound how much
+# memory one unauthenticated peer can make the server reserve; raise them
+# again for high-bandwidth, high-latency links.
+#streamRecvWindow = 1048576
+#connRecvWindow = 8388608
+#sendWindow = 8388608
+
+# Pre-login and visitor resource limits (#13). All values below are the
+# defaults; uncomment to override.
+# [limits]
+#preLoginTimeoutSecs = 10
+#idleTimeoutSecs = 3600
+#firstMessageMaxBytes = 4096
+#preLoginMaxConns = 512
+#preLoginMaxConnsPerIp = 32
+#maxWaitingVisitorsPerTunnel = 32
+#maxOutstandingDataConns = 8
+#poolIdleTtlSecs = 300
 
 [transport.tls]
 force = true

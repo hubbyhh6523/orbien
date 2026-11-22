@@ -23,6 +23,21 @@ fn server_snapshot_starts_empty() {
     assert_eq!(s.total_traffic_in, 0);
     assert_eq!(s.total_traffic_out, 0);
     assert!(s.tunnel_type_counts.is_empty());
+    assert!(s.limit_rejections.is_empty());
+}
+
+// ── limit rejection counters (#13) ────────────────────────────────────────────
+
+#[test]
+fn limit_rejections_count_by_reason() {
+    let m = make();
+    m.inc_limit_reject("pre_login_cap");
+    m.inc_limit_reject("pre_login_cap");
+    m.inc_limit_reject("waiting_visitors");
+    let s = m.server_snapshot();
+    assert_eq!(s.limit_rejections.get("pre_login_cap"), Some(&2));
+    assert_eq!(s.limit_rejections.get("waiting_visitors"), Some(&1));
+    assert_eq!(s.limit_rejections.get("idle_timeout"), None);
 }
 
 #[test]

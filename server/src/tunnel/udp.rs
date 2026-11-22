@@ -141,7 +141,7 @@ async fn data_conn_loop(
         let data = {
             tokio::select! {
                 _ = notify.notified() => return,
-                w = control.get_data_conn() => w,
+                w = control.get_data_conn(&tunnel_name) => w,
             }
         };
 

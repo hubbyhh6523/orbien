@@ -118,12 +118,16 @@ pub async fn run_http_gw_listener(
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "http gateway listener ready");
 
+    // #13: an accept error backs off and retries; it no longer ends
+    // the listener (and, via Service::run, the whole server).
+    let mut backoff = crate::accept::AcceptBackoff::new();
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        backoff.reset();
                         orbien_core::net::enable_nodelay(&stream);
                         let gw = Arc::clone(&gw);
                         // Snapshot current policy; hot-reload swaps this on the next connection.
@@ -135,8 +139,7 @@ pub async fn run_http_gw_listener(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "http gateway accept failed");
-                        break;
+                        backoff.on_error(&e.into()).await;
                     }
                 }
             }
@@ -227,7 +230,7 @@ async fn handle_http_ingress(
     )?;
     validate_single_request(&raw)?;
 
-    let data = match control.get_data_conn().await {
+    let data = match control.get_data_conn(&route.tunnel_name).await {
         Ok(w) => w,
         Err(e) => {
             write_bad_gateway(&mut ingress.stream).await;
@@ -252,13 +255,25 @@ async fn handle_http_ingress(
     let data = maybe_limit(data, route.limiter.clone());
     let _guard = control.metrics.track_connection(&route.tunnel_name, "http");
 
-    let stats = forward_one(
+    let stats = match forward_one(
         ingress.stream,
         data,
         raw,
-        ForwardLimits::default(),
+        ForwardLimits {
+            idle_timeout: control.idle_timeout(),
+            ..ForwardLimits::default()
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(stats) => stats,
+        Err(e) => {
+            if e.to_string().contains("idle timeout") {
+                control.metrics.inc_limit_reject("idle_timeout");
+            }
+            return Err(e);
+        }
+    };
 
     control.metrics.add_traffic_in(
         &route.tunnel_name,
