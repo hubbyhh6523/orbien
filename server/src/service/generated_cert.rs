@@ -140,7 +140,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orbien-12-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Canonicalize: resolve_generated_cert canonicalizes the config
+        // path, and on Windows that changes the spelling (\\?\ prefix,
+        // 8.3 names expanded) — compare canonical with canonical.
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     #[test]
