@@ -12,11 +12,14 @@ source "$script_dir/common.sh"
 SERVER_PORT=49532
 DASHBOARD_PORT=49533
 DB_USER="${DASHBOARD_USER:-admin}"
-DB_PASS="${DASHBOARD_PASSWORD:-admin}"
+DB_PASS="${DASHBOARD_PASSWORD:-dash-e2e-pass-9f31}"
 COOKIE_JAR="$RUN_DIR/dashboard-cookies.txt"
 
 cat >"$RUN_DIR/server-dashboard.toml" <<EOF
 listen = "127.0.0.1:$SERVER_PORT"
+
+[auth]
+token = "e2e-test-token"
 
 [dashboard]
 addr     = "127.0.0.1"

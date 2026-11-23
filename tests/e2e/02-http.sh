@@ -25,6 +25,10 @@ server = "127.0.0.1:$SERVER_PORT"
 type  = "token"
 token = "$E2E_TOKEN"
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name     = "http-e2e"
 protocol = "http"

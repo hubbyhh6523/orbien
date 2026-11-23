@@ -4295,6 +4295,7 @@ dependencies = [
  "hmac",
  "kcp-tokio",
  "quinn",
+ "rand 0.10.2",
  "rcgen",
  "rustls",
  "rustls-pemfile",

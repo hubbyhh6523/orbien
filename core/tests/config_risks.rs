@@ -27,6 +27,36 @@ password = 'CHANGE_ME_NOT_FOR_LOGS'
 }
 
 #[test]
+fn placeholder_secrets_refuse_startup_but_only_warn_on_check_config() {
+    // --check-config stays warn-only: risk_warnings reports the
+    // placeholder, but only the runtime refusal rejects it.
+    let mut cfg: ServerConfig = toml::from_str("[auth]\ntoken = 'YOUR_TOKEN'").unwrap();
+    cfg.complete();
+    assert!(cfg.risk_warnings().join("\n").contains("placeholder-secret"));
+    assert!(cfg.refuse_placeholder_secrets().is_err());
+    // Empty token with no policies is refused too.
+    assert!(ServerConfig::default().refuse_placeholder_secrets().is_err());
+    // A real token passes; a short one only warns.
+    let mut ok: ServerConfig =
+        toml::from_str("[auth]\ntoken = 'a-very-long-real-token-that-is-long-enough-1234'").unwrap();
+    ok.complete();
+    assert!(ok.refuse_placeholder_secrets().is_ok());
+    assert!(!ok.risk_warnings().join("\n").contains("short-token"));
+    let mut short: ServerConfig = toml::from_str("[auth]\ntoken = 'short-token'").unwrap();
+    short.complete();
+    assert!(short.risk_warnings().join("\n").contains("short-token"));
+    assert!(short.refuse_placeholder_secrets().is_ok());
+    // Placeholder dashboard password is refused when the dashboard is
+    // on and auth is enabled.
+    let mut dash: ServerConfig = toml::from_str(
+        "[auth]\ntoken = 'a-very-long-real-token-that-is-long-enough-1234'\n[dashboard]\nport = 8020\nuser = 'admin'\npassword = 'CHANGE_ME'",
+    )
+    .unwrap();
+    dash.complete();
+    assert!(dash.refuse_placeholder_secrets().is_err());
+}
+
+#[test]
 fn completed_mtls_config_does_not_warn_that_tls_is_optional() {
     let mut cfg: ServerConfig = toml::from_str("[transport.tls]\ntrustedCaFile = 'ca.pem'").unwrap();
     cfg.complete();

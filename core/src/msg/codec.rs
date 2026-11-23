@@ -49,6 +49,8 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(
     let body = match msg {
         Message::Login(m) => serde_json::to_vec(m)?,
         Message::LoginResp(m) => serde_json::to_vec(m)?,
+        Message::Challenge(m) => serde_json::to_vec(m)?,
+        Message::Hello(m) => serde_json::to_vec(m)?,
         Message::NewTunnel(m) => serde_json::to_vec(m)?,
         Message::NewTunnelResp(m) => serde_json::to_vec(m)?,
         Message::CloseTunnel(m) => serde_json::to_vec(m)?,
@@ -115,6 +117,8 @@ pub async fn read_msg_with_limits<R: AsyncRead + Unpin, F: Fn(u8) -> u32>(
     let msg = match type_byte {
         TYPE_LOGIN => Message::Login(serde_json::from_slice(&buf)?),
         TYPE_LOGIN_RESP => Message::LoginResp(serde_json::from_slice(&buf)?),
+        TYPE_CHALLENGE => Message::Challenge(serde_json::from_slice(&buf)?),
+        TYPE_HELLO => Message::Hello(serde_json::from_slice(&buf)?),
         TYPE_NEW_TUNNEL => Message::NewTunnel(serde_json::from_slice(&buf)?),
         TYPE_NEW_TUNNEL_RESP => Message::NewTunnelResp(serde_json::from_slice(&buf)?),
         TYPE_CLOSE_TUNNEL => Message::CloseTunnel(serde_json::from_slice(&buf)?),
@@ -153,6 +157,8 @@ mod tests {
         let body = match msg {
             Message::Login(m) => serde_json::to_vec(m).unwrap(),
             Message::LoginResp(m) => serde_json::to_vec(m).unwrap(),
+            Message::Challenge(m) => serde_json::to_vec(m).unwrap(),
+            Message::Hello(m) => serde_json::to_vec(m).unwrap(),
             Message::NewTunnel(m) => serde_json::to_vec(m).unwrap(),
             Message::NewTunnelResp(m) => serde_json::to_vec(m).unwrap(),
             Message::CloseTunnel(m) => serde_json::to_vec(m).unwrap(),
@@ -179,13 +185,22 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             user: "alice".into(),
-            auth_digest: "abc123".into(),
             timestamp: 1_700_000_000,
             session_id: "session-1".into(),
             pool_count: 4,
             resume_proof: String::new(),
+            challenge_response: "resp".into(),
+            client_nonce: "nonce".into(),
+            capabilities: vec!["challenge-auth-v1".into()],
         }))
         .await;
+        roundtrip(Message::Challenge(Challenge {
+            nonce: "aa".repeat(32),
+            version: "0.2.0".into(),
+        }))
+        .await;
+        // #12: the Hello that announces a stream before the Challenge.
+        roundtrip(Message::Hello(Hello::default())).await;
     }
 
     #[tokio::test]
@@ -223,11 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_pong_roundtrip() {
-        roundtrip(Message::Ping(Ping {
-            auth_digest: "key".into(),
-            timestamp: 123,
-        }))
-        .await;
+        roundtrip(Message::Ping(Ping::default())).await;
         roundtrip(Message::Pong(Pong {
             error: "".into(),
         }))
@@ -375,6 +386,8 @@ mod tests {
         assert_eq!(max_bytes_for_type(TYPE_UDP_PACKET), MAX_MSG_SIZE);
         for t in [
             TYPE_LOGIN_RESP,
+            TYPE_CHALLENGE,
+            TYPE_HELLO,
             TYPE_NEW_TUNNEL_RESP,
             TYPE_CLOSE_TUNNEL,
             TYPE_REQ_DATA_CONN,

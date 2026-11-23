@@ -46,6 +46,12 @@ fn main() -> Result<()> {
         println!("configuration OK");
         return Ok(());
     }
+    // #12: refuse to start on an empty or placeholder token, a
+    // placeholder policy token, or a placeholder dashboard password.
+    // --check-config above stays warn-only for the sample configs.
+    if let Err(e) = cfg.refuse_placeholder_secrets() {
+        anyhow::bail!("refusing to start: {e}");
+    }
     orbien_core::config::print_config_warnings(&cfg.risk_warnings());
 
     tracing::info!(

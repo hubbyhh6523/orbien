@@ -27,6 +27,10 @@ server = "127.0.0.1:$SERVER_PORT"
 type  = "token"
 token = "$TOKEN"
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name       = "tok-tcp"
 protocol   = "tcp"
@@ -41,6 +45,11 @@ server = "127.0.0.1:$SERVER_PORT"
 type  = "token"
 token = "wrong-token"
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+# (Kept so the rejection comes from the server, not the client guard.)
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name       = "tok-wrong"
 protocol   = "tcp"
@@ -50,6 +59,11 @@ EOF
 
 cat >"$RUN_DIR/client-token-empty.toml" <<EOF
 server = "127.0.0.1:$SERVER_PORT"
+
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+# (Kept so the rejection comes from the server, not the client guard.)
+[transport.tls]
+insecureSkipVerify = true
 
 [[tunnels]]
 name       = "tok-empty"

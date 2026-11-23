@@ -20,7 +20,53 @@ fn secret_warning(out: &mut Vec<String>, path: &str, value: &str) {
     }
 }
 
+/// #12: a token shorter than 32 characters is a warning only, not a
+/// refusal — it may be a test token, and length alone does not prove
+/// weakness. Documented minimum is 32 random bytes.
+fn short_token_warning(out: &mut Vec<String>, path: &str, value: &str) {
+    let token = value.trim();
+    if !token.is_empty() && token.chars().count() < 32 {
+        out.push(format!(
+            "[short-token] {path} is shorter than 32 characters; use at least 32 random bytes (e.g. `openssl rand -hex 32`)"
+        ));
+    }
+}
+
 impl ServerConfig {
+    /// #12: refuse to start with an empty or placeholder token, a
+    /// placeholder policy token, or a placeholder dashboard password.
+    /// Runtime-only — called from server main after the `--check-config`
+    /// early return. `--check-config` stays warn-only so the sample
+    /// configs, which contain YOUR_TOKEN, keep passing CI's check set.
+    /// An empty policy token stays ignored-with-warning (existing
+    /// behaviour) and is not a refusal.
+    pub fn refuse_placeholder_secrets(&self) -> Result<(), String> {
+        if self.auth.token.trim().is_empty() && self.auth.token_policies.is_empty() {
+            return Err(
+                "auth has no token or token policies; set auth.token to at least 32 random bytes (e.g. `openssl rand -hex 32`)".into(),
+            );
+        }
+        if placeholder(&self.auth.token) {
+            return Err("auth.token contains an example/default secret; set a real token".into());
+        }
+        for (index, policy) in self.auth.token_policies.iter().enumerate() {
+            if policy.token.trim().is_empty() {
+                continue;
+            }
+            if placeholder(&policy.token) {
+                return Err(format!(
+                    "auth.token_policies[{index}].token contains an example/default secret; set a real token"
+                ));
+            }
+        }
+        if self.dashboard.enabled() && !self.dashboard.disable_auth && placeholder(&self.dashboard.password) {
+            return Err(
+                "dashboard.password contains an example/default secret; set a real password".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn risk_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !self.transport.tls.force {
@@ -33,9 +79,11 @@ impl ServerConfig {
             out.push("[empty-token] auth has no token or token policies".into());
         }
         secret_warning(&mut out, "auth.token", &self.auth.token);
+        short_token_warning(&mut out, "auth.token", &self.auth.token);
         for (index, policy) in self.auth.token_policies.iter().enumerate() {
             let path = format!("auth.token_policies[{index}]");
             secret_warning(&mut out, &format!("{path}.token"), &policy.token);
+            short_token_warning(&mut out, &format!("{path}.token"), &policy.token);
             if policy.token.trim().is_empty() {
                 out.push(format!("[empty-policy-token] {path}.token is empty; policy is ignored"));
             }
@@ -78,6 +126,7 @@ impl ClientConfig {
             out.push("[empty-token] auth.token is empty".into());
         }
         secret_warning(&mut out, "auth.token", &self.auth.token);
+        short_token_warning(&mut out, "auth.token", &self.auth.token);
         for (index, tunnel) in self.tunnels.iter().enumerate() {
             secret_warning(&mut out, &format!("tunnels[{index}].basicAuthPassword"), &tunnel.basic_auth_password);
             if let Some(plugin) = &tunnel.plugin {

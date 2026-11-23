@@ -43,6 +43,37 @@ type OnTunnelRemote = Arc<dyn Fn(String, String) + Send + Sync>;
 /// configured cap too, this is the client-side backstop.
 const DATA_CONN_BURST: usize = 8;
 
+/// Seconds the client waits for the server's Challenge after sending
+/// Hello on a control stream (#12). Longer than the server's
+/// pre-login deadline would be pointless: the server closes the
+/// connection at 10s.
+const CHALLENGE_WAIT_SECS: u64 = 10;
+
+/// Capability this client advertises in Login (#12). The server
+/// records it; the challenge response binds it.
+const CAPABILITY_CHALLENGE_AUTH_V1: &str = "challenge-auth-v1";
+
+/// #12: read the server's Challenge, its answer to the client's Hello
+/// on every control or data stream. An old server never sends one —
+/// that is a hard cut, not a fallback.
+async fn read_challenge(stream: &mut DynStream) -> Result<msg::Challenge> {
+    let msg = tokio::time::timeout(
+        Duration::from_secs(CHALLENGE_WAIT_SECS),
+        msg::read_msg(stream),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!("server does not support challenge authentication (no Challenge received)")
+    })??;
+    match msg {
+        Message::Challenge(c) => Ok(c),
+        other => Err(anyhow!(
+            "expected Challenge, got message type {}; server does not support challenge authentication",
+            other.type_byte()
+        )),
+    }
+}
+
 pub struct Control {
     cfg: ClientConfig,
     session_id: String,
@@ -82,8 +113,22 @@ impl Control {
             "control stream opened"
         );
 
+        // #12: announce the stream with an empty Hello, then wait for
+        // the server's Challenge and answer it. The response is an HMAC
+        // over the challenge nonce and the Login fields, so a captured
+        // Login cannot be replayed on another connection. The Hello must
+        // come first: yamux 0.14 and quinn 0.11 open outbound streams
+        // lazily — the peer only learns of a stream when the opener
+        // writes to it — so reading first would deadlock (the server
+        // never sees the stream). A server that never sends a Challenge
+        // is an old server — hard cut, no fallback to the
+        // timestamp-only digest.
+        msg::write_msg(&mut stream, &Message::Hello(msg::Hello::default())).await?;
+        let challenge = read_challenge(&mut stream).await?;
+        let client_nonce = auth::new_nonce();
+        let hostname = hostname();
         let timestamp = now_secs();
-        let auth_digest = auth::compute_auth_digest(&cfg.auth.token, timestamp);
+        let capabilities = vec![CAPABILITY_CHALLENGE_AUTH_V1.to_string()];
         // #11: prove possession of the previous session's secret when
         // resuming its id. Without a stored secret (or with a wrong one)
         // the server issues a new id instead of taking over the old one.
@@ -98,17 +143,29 @@ impl Control {
                 timestamp,
             )
         };
+        let challenge_response = auth::compute_login_response(
+            &cfg.auth.token,
+            &challenge.nonce,
+            &previous_session_id,
+            &cfg.user,
+            &hostname,
+            cfg.transport.pool_count,
+            VERSION,
+            &capabilities,
+        );
         let login = Login {
             version: VERSION.into(),
-            hostname: hostname(),
+            hostname,
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             user: cfg.user.clone(),
-            auth_digest,
             timestamp,
             session_id: previous_session_id,
             pool_count: cfg.transport.pool_count,
             resume_proof,
+            challenge_response,
+            client_nonce: client_nonce.clone(),
+            capabilities,
         };
         tracing::info!(
             hostname = %login.hostname,
@@ -138,6 +195,16 @@ impl Control {
 
         if !resp.error.is_empty() {
             return Err(anyhow!("login rejected by server: {}", resp.error));
+        }
+
+        // #12: the server proves it knows the token before the client
+        // acts on any ReqDataConn/StartDataConn. A server that cannot
+        // prove it must not be allowed to make the client open a local
+        // connection.
+        if !auth::verify_server_proof(&cfg.auth.token, &resp.server_proof, &client_nonce, &resp.session_id) {
+            return Err(anyhow!(
+                "server proof verification failed: the server did not prove it knows the token; refusing to proceed"
+            ));
         }
 
         tracing::info!(session_id = %resp.session_id, "login ok");
@@ -417,11 +484,10 @@ impl Control {
                 break;
             }
             tick.tick().await;
-            let timestamp = now_secs();
-            let ping = Ping {
-                auth_digest: auth::compute_auth_digest(&self.cfg.auth.token, timestamp),
-                timestamp,
-            };
+            // #12: the heartbeat carries no digest — Ping is an empty
+            // struct now. The control stream itself was authenticated
+            // at login; a heartbeat proves nothing.
+            let ping = Ping::default();
             let mut writer = self.writer.lock().await;
             if msg::write_msg(&mut *writer, &Message::Ping(ping))
                 .await
@@ -484,26 +550,30 @@ impl Control {
     async fn handle_req_data_conn(self: Arc<Self>) -> Result<()> {
         let mut data = self.connector.open().await?;
 
-        let timestamp = now_secs();
-        // #11: prove this data connection belongs to this session. The
-        // auth_digest is kept as a transition field; the proof is what
-        // the server verifies.
+        // #12: announce the stream with an empty Hello, then read the
+        // server's Challenge. The NewDataConn proof is bound to this
+        // stream's fresh nonce, not a client-chosen timestamp, so a
+        // captured proof cannot be replayed on another connection. The
+        // Hello must come first (see start(): lazily-opened streams
+        // are only announced by a write).
+        msg::write_msg(&mut data, &Message::Hello(msg::Hello::default())).await?;
+        let challenge = read_challenge(&mut data).await?;
+
+        // #11: prove this data connection belongs to this session.
         let proof = if self.session_secret.is_empty() {
             String::new()
         } else {
-            auth::compute_session_proof(
+            auth::compute_session_proof_nonce(
                 &self.session_secret,
                 "data-conn",
                 &self.session_id,
-                timestamp,
+                &challenge.nonce,
             )
         };
         msg::write_msg(
             &mut data,
             &Message::NewDataConn(NewDataConn {
                 session_id: self.session_id.clone(),
-                auth_digest: auth::compute_auth_digest(&self.cfg.auth.token, timestamp),
-                timestamp,
                 proof,
             }),
         )

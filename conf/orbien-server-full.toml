@@ -18,6 +18,8 @@ udpPacketSize = 1500
 
 [auth]
 type = "token"
+# The server refuses to start with an empty or placeholder token (#12).
+# Generate a real one with: openssl rand -hex 32
 token = "YOUR_TOKEN"
 
 # Optional: restrict what each token is allowed to do.

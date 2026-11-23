@@ -41,6 +41,10 @@ token = "e2e-test-token"
 [transport]
 poolCount = 2
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name        = "tcp-limits"
 protocol    = "tcp"

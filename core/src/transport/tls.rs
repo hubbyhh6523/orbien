@@ -104,7 +104,7 @@ pub fn install_ring_provider() -> Result<()> {
 /// the same key (e.g. Let's Encrypt renewal) changes the fingerprint and
 /// triggers a re-pin. This is conservative and safe; the alternative (parsing
 /// the SPKI out of the DER) needs an x509 parser dependency.
-fn spki_fingerprint(end_entity: &CertificateDer<'_>) -> String {
+fn cert_fingerprint(end_entity: &CertificateDer<'_>) -> String {
     let digest = Sha256::digest(end_entity.as_ref());
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {
@@ -118,7 +118,7 @@ fn spki_fingerprint(end_entity: &CertificateDer<'_>) -> String {
 type FingerprintCache = Mutex<HashMap<String, String>>;
 
 /// TOFU verifier: accepts the server certificate on first contact (recording
-/// its SPKI hash), then requires an exact match on every later connection.
+/// the whole-certificate hash), then requires an exact match on every later connection.
 /// A mismatch is a hard failure — that's a potential MITM.
 #[derive(Debug)]
 struct TofuServerVerifier {
@@ -213,7 +213,7 @@ impl ServerCertVerifier for TofuServerVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Host key: DNS name or IP literal as presented by the connector.
         let host_key = server_name.to_str().to_string();
-        let fingerprint = spki_fingerprint(end_entity);
+        let fingerprint = cert_fingerprint(end_entity);
         match self.check_and_pin(&host_key, &fingerprint) {
             Ok(true) => {
                 tracing::warn!(
