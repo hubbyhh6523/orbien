@@ -75,7 +75,7 @@ impl TlsDialOpts {
 /// NOT in `TlsDialOpts::from_config` or `check_tls_config`:
 /// `--check-config` stays warn-only (scripts/check-configs.py requires
 /// a minimal client config to pass with reason `no-server-trust`).
-fn require_server_trust(cfg: &ClientConfig) -> Result<()> {
+pub(crate) fn require_server_trust(cfg: &ClientConfig) -> Result<()> {
     let tls = &cfg.transport.tls;
     if !tls.enable || tls.insecure_skip_verify {
         return Ok(());
