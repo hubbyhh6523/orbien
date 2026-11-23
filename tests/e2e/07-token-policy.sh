@@ -49,6 +49,10 @@ token = "$TOKEN"
 [transport]
 tcpMux = false
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name     = "$2"
 protocol = "http"
@@ -142,6 +146,10 @@ token = "$2"
 
 [transport]
 tcpMux = false
+
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
 
 $3
 EOF

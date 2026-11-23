@@ -3,12 +3,17 @@
 
 Subcommands (each exits 0 on pass, 1 on fail):
   silent-close HOST PORT DEADLINE  -- connect, send nothing, expect EOF
-                                     within DEADLINE+3s.
+                                     within DEADLINE+3s. (A raw connection
+                                     to a yamux listener can never receive
+                                     a Challenge — that only exists on an
+                                     opened stream — so no Hello here.)
   slow-byte HOST PORT DEADLINE     -- send 1 byte every 0.4s, expect EOF
                                      within DEADLINE+3s (deadline is from
                                      accept, so slow dribble must not extend it).
-  oversized-first HOST PORT        -- send a Login header declaring a 5000
-                                     byte body and no body; expect EOF < 3s.
+  oversized-first HOST PORT        -- send Hello, consume the #12
+                                     Challenge, then send a Login header
+                                     declaring a 5000 byte body and no
+                                     body; expect EOF < 3s.
   flood-cap HOST PORT CAP          -- open CAP silent conns, then one more;
                                      the extra one must get EOF within 2s
                                      (cap enforced), the held ones stay open.
@@ -20,10 +25,49 @@ Subcommands (each exits 0 on pass, 1 on fail):
                                      then stay silent; expect EOF within
                                      IDLE+10s of the echo (idle timeout).
 """
+import json
 import socket
+import struct
 import sys
 import threading
 import time
+
+
+def read_msg(sock):
+    """Read one framed message: 1 type byte + u32 LE length + JSON body."""
+    header = b""
+    while len(header) < 5:
+        chunk = sock.recv(5 - len(header))
+        if not chunk:
+            return None, None
+        header += chunk
+    mtype, length = header[0], struct.unpack("<I", header[1:5])[0]
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            return None, None
+        body += chunk
+    return mtype, json.loads(body)
+
+
+def send_hello(sock):
+    """#12: the client announces the stream with an empty Hello and the
+    server answers with a Challenge. Hello must come first: yamux and
+    QUIC open outbound streams lazily, so a client that only reads
+    would never be seen by the server."""
+    sock.sendall(b"H" + struct.pack("<I", 2) + b"{}")
+
+
+def consume_challenge(sock):
+    """#12: send Hello, then read and check the server's Challenge;
+    returns True when a Challenge was consumed."""
+    send_hello(sock)
+    mtype, _payload = read_msg(sock)
+    if mtype != ord("C"):
+        print(f"FAIL: expected Challenge ('C'), got {mtype!r}")
+        return False
+    return True
 
 
 def silent_close(host, port, deadline):
@@ -31,6 +75,9 @@ def silent_close(host, port, deadline):
     s.settimeout(deadline + 5)
     start = time.monotonic()
     try:
+        # No Hello, no Challenge: on a yamux listener a raw connection
+        # never gets a Challenge (see module docstring). Silence alone
+        # must still be cut at the pre-login deadline.
         data = s.recv(1)
     except socket.timeout:
         print(f"FAIL: silent conn still open after {deadline + 5:.0f}s")
@@ -73,7 +120,10 @@ def slow_byte(host, port, deadline):
 def oversized_first(host, port):
     s = socket.create_connection((host, port), timeout=5)
     s.settimeout(5)
-    # Login type byte 'A', 5000-byte body declared, no body sent.
+    # #12: send Hello, consume the Challenge, then send a Login header
+    # declaring a 5000 byte body and no body; expect EOF < 3s.
+    if not consume_challenge(s):
+        return 1
     s.sendall(b"A" + (5000).to_bytes(4, "little"))
     start = time.monotonic()
     try:

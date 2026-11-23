@@ -69,7 +69,31 @@ impl TlsDialOpts {
     }
 }
 
+/// #12: verify-by-default. With TLS on, the client must either verify
+/// the server (trusted CA or TOFU pin) or explicitly opt into
+/// skip-verify with `transport.tls.insecureSkipVerify`. Deliberately
+/// NOT in `TlsDialOpts::from_config` or `check_tls_config`:
+/// `--check-config` stays warn-only (scripts/check-configs.py requires
+/// a minimal client config to pass with reason `no-server-trust`).
+fn require_server_trust(cfg: &ClientConfig) -> Result<()> {
+    let tls = &cfg.transport.tls;
+    if !tls.enable || tls.insecure_skip_verify {
+        return Ok(());
+    }
+    if !tls.trusted_ca_file.trim().is_empty() || !tls.tofu_store_file.trim().is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to connect without server verification: no transport.tls.trustedCaFile or \
+         transport.tls.tofuStoreFile is configured; set transport.tls.insecureSkipVerify = true \
+         to connect anyway (insecure — MITM possible), or configure a CA / TOFU store"
+    ))
+}
+
 pub async fn build_connector(cfg: &ClientConfig) -> Result<Arc<dyn Connector>> {
+    // #12: verify-by-default — refuse before any dial. Covers TCP/WS/
+    // KCP and QUIC alike, since every protocol goes through here.
+    require_server_trust(cfg)?;
     let tls = TlsDialOpts::from_config(cfg)?;
     let max_streams = cfg.transport.max_yamux_streams.unwrap_or(MAX_NUM_STREAMS);
     match cfg.protocol()? {
@@ -311,5 +335,34 @@ struct QuicConnector {
 impl Connector for QuicConnector {
     async fn open(&self) -> Result<DynStream> {
         self.session.open_stream().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cfg(tls: serde_json::Value) -> ClientConfig {
+        serde_json::from_value(json!({
+            "server": "127.0.0.1:9527",
+            "transport": { "tls": tls },
+        }))
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn refuses_unverified_tls_by_default() {
+        // No CA, no TOFU, no opt-in: refuse, and name the option.
+        let err = require_server_trust(&cfg(json!({}))).unwrap_err();
+        assert!(
+            err.to_string().contains("insecureSkipVerify"),
+            "error names the opt-in: {err}"
+        );
+        // Explicit opt-in, CA, TOFU, or TLS off: allowed.
+        assert!(require_server_trust(&cfg(json!({ "insecureSkipVerify": true }))).is_ok());
+        assert!(require_server_trust(&cfg(json!({ "trustedCaFile": "./ca.crt" }))).is_ok());
+        assert!(require_server_trust(&cfg(json!({ "tofuStoreFile": "./pin.json" }))).is_ok());
+        assert!(require_server_trust(&cfg(json!({ "enable": false }))).is_ok());
     }
 }

@@ -2,8 +2,10 @@ use super::pre_login::{new_slot, PreLoginPermit, PreLoginSlot};
 use super::Service;
 use crate::accept::AcceptBackoff;
 use anyhow::{anyhow, Result};
+use orbien_core::auth;
 use orbien_core::msg::{self, Message};
 use orbien_core::transport::{self, boxed_stream, DynStream};
+use orbien_core::VERSION;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -256,45 +258,97 @@ impl Service {
         peer: SocketAddr,
         pre_login: PreLoginSlot,
     ) -> Result<()> {
-        // #13: the first message has its own small size limit and the
-        // pre-login deadline; a peer that declares a body and stalls is
-        // rejected from the header alone (codec checks before allocating).
-        let first = match msg::read_msg_limited_timeout(
+        // #12: the client announces the stream with an empty Hello and
+        // the server answers with a fresh single-use Challenge; the
+        // client answers that with its bound Login/NewDataConn. The
+        // client must speak first: yamux 0.14 and quinn 0.11 open
+        // outbound streams lazily — the peer only learns of a stream
+        // when the opener writes to it — so a server-speaks-first
+        // Challenge deadlocks (the client waits for a Challenge the
+        // server never sends, because the server never sees the
+        // stream). The whole dance shares one #13 pre-login deadline
+        // from connection open, so a challenger cannot hold a slot
+        // past it. The Challenge goes out on data streams too (their
+        // #11 session-secret proof is bound to this nonce); the client
+        // sends Hello there before NewDataConn. An old client sends
+        // Login first instead of Hello and is rejected here (hard cut).
+        let deadline = tokio::time::Instant::now() + self.cfg.limits.pre_login_timeout();
+        let first = self.read_pre_login_msg(&mut stream, deadline).await?;
+        if !matches!(first, Message::Hello(_)) {
+            return Err(anyhow!(
+                "unexpected first message: {:?} (expected Hello)",
+                first.type_byte()
+            ));
+        }
+        let challenge_nonce = auth::new_nonce();
+        msg::write_msg(
             &mut stream,
+            &Message::Challenge(msg::Challenge {
+                nonce: challenge_nonce.clone(),
+                version: VERSION.into(),
+            }),
+        )
+        .await?;
+        // #13: the second message has the same small size limit as the
+        // first — a peer that declares a body and stalls is rejected
+        // from the header alone (codec checks before allocating).
+        let second = self.read_pre_login_msg(&mut stream, deadline).await?;
+        match second {
+            Message::Login(login) => {
+                self.register_control(stream, login, peer, pre_login, &challenge_nonce)
+                    .await
+            }
+            Message::NewDataConn(nw) => {
+                self.register_data_conn(stream, nw, pre_login, &challenge_nonce)
+                    .await
+            }
+            other => Err(anyhow!(
+                "unexpected second message: {:?} (expected Login or NewDataConn)",
+                other.type_byte()
+            )),
+        }
+    }
+
+    /// Read one pre-login message (Hello, then Login/NewDataConn)
+    /// against the single #13 pre-login deadline shared by the whole
+    /// challenge dance. Both reads draw down the same deadline, so a
+    /// challenger cannot hold a slot past it.
+    async fn read_pre_login_msg(
+        &self,
+        stream: &mut DynStream,
+        deadline: tokio::time::Instant,
+    ) -> Result<Message> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match msg::read_msg_limited_timeout(
+            stream,
             self.cfg.limits.first_message_max_bytes,
-            self.cfg.limits.pre_login_timeout(),
+            remaining,
         )
         .await
         {
-            Ok(m) => m,
+            Ok(m) => Ok(m),
             Err(msg::MessageReadError::Timeout(_)) => {
                 self.metrics.inc_limit_reject("pre_login_timeout");
-                return Err(anyhow!("pre-login deadline exceeded"));
+                Err(anyhow!("pre-login deadline exceeded"))
             }
             Err(msg::MessageReadError::TooLarge(_)) => {
                 self.metrics.inc_limit_reject("first_message_too_large");
-                return Err(anyhow!("first message too large"));
+                Err(anyhow!("first message too large"))
             }
-            Err(e) => return Err(e.into()),
-        };
-        match first {
-            Message::Login(login) => {
-                self.register_control(stream, login, peer, pre_login).await
-            }
-            Message::NewDataConn(nw) => {
-                self.register_data_conn(stream, nw, pre_login).await
-            }
-            other => Err(anyhow!("unexpected first message: {:?}", other.type_byte())),
+            Err(e) => Err(e.into()),
         }
     }
 }
 
 fn yamux_err(e: anyhow::Error, peer: SocketAddr) -> anyhow::Error {
     let msg = e.to_string();
-    if msg.contains("unknown version: 65") || msg.contains("unknown version: 87") {
+    if msg.contains("unknown version: 65")
+        || msg.contains("unknown version: 87")
+        || msg.contains("unknown version: 72")
+    {
         anyhow!(
             "yamux session {peer}: {e} — transport.tcpMux mismatch: server expects yamux \
-             (tcpMux=true) but peer sent a raw control frame (Login 'A'=65 / NewDataConn 'W'=87). \
+             (tcpMux=true) but peer sent a raw control frame (Hello 'H'=72 / Login 'A'=65 / NewDataConn 'W'=87). \
              Set the same tcpMux on orbien and orbien-server, then restart both."
         )
     } else {

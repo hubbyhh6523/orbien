@@ -26,6 +26,8 @@ rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 socket2 = { workspace = true }
+# Secure random nonces (#12); same pinned version as the server crate.
+rand = "=0.10.2"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }

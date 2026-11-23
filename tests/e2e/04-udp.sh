@@ -27,6 +27,10 @@ udpPacketSize = 8192
 type  = "token"
 token = "$E2E_TOKEN"
 
+# #12: test server uses an ephemeral self-signed cert; no CA/TOFU.
+[transport.tls]
+insecureSkipVerify = true
+
 [[tunnels]]
 name       = "udp-e2e"
 protocol   = "udp"

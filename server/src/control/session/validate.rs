@@ -11,6 +11,10 @@ use orbien_core::msg::{Login, NewTunnel};
 
 pub const MAX_LOGIN_FIELD_LEN: usize = 64;
 pub const MAX_TUNNEL_NAME_LEN: usize = 64;
+/// #12: a Login carries at most this many capability strings; the
+/// challenge response binds them, so an unbounded list would be a
+/// way to smuggle bytes past the 4 KiB Login cap.
+pub const MAX_CAPABILITIES: usize = 16;
 pub const MAX_DOMAINS_PER_TUNNEL: usize = 32;
 pub const MAX_LOCATIONS_PER_TUNNEL: usize = 32;
 pub const MAX_ROUTES_PER_TUNNEL: usize = 64;
@@ -48,6 +52,25 @@ pub fn validate_login(login: &Login) -> Result<(), String> {
     }
     if !login.session_id.is_empty() && !valid_session_id(&login.session_id) {
         return Err("invalid session_id".into());
+    }
+    // #12: capabilities are bound by the challenge response, so they
+    // need the same length/charset rule as the other Login strings,
+    // plus a count cap. (challenge_response/client_nonce need no
+    // format check here: a malformed response already fails the HMAC,
+    // and the nonce is an opaque HMAC input bounded by the 4 KiB
+    // Login cap.)
+    if login.capabilities.len() > MAX_CAPABILITIES {
+        return Err(format!(
+            "too many capabilities: {} > {MAX_CAPABILITIES}",
+            login.capabilities.len()
+        ));
+    }
+    for cap in &login.capabilities {
+        if !valid_login_field(cap) {
+            return Err(format!(
+                "invalid capability: at most {MAX_LOGIN_FIELD_LEN} chars, no control characters"
+            ));
+        }
     }
     Ok(())
 }
@@ -128,11 +151,13 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             user: "user".into(),
-            auth_digest: String::new(),
             timestamp: 0,
             session_id: String::new(),
             pool_count: 1,
             resume_proof: String::new(),
+            challenge_response: String::new(),
+            client_nonce: String::new(),
+            capabilities: vec!["challenge-auth-v1".into()],
         }
     }
 

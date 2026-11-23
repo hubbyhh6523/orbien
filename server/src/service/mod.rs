@@ -1,4 +1,5 @@
 mod dashboard_view;
+mod generated_cert;
 mod ingress;
 mod p2p_broker;
 mod pre_login;
@@ -61,6 +62,11 @@ pub struct Service {
 
 impl Service {
     pub fn new(cfg: ServerConfig) -> Result<Self> {
+        let mut cfg = cfg;
+        // #12: persist the auto-generated server certificate next to the
+        // config file, so TOFU pins survive restarts. Runtime only —
+        // check-config never reaches here.
+        generated_cert::resolve_generated_cert(&mut cfg)?;
         let (policy, tls_config) = Self::prepare_config(&cfg)?;
         let access = Arc::new(RwLock::new(Arc::new(policy)));
         let http_gw = if cfg.http_gw_enabled() {

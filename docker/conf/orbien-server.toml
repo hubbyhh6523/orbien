@@ -4,6 +4,8 @@ listen = "0.0.0.0:9527"
 # httpsGwPort = 443
 # rootDomain = "example.com"
 
+# The server refuses to start with an empty or placeholder token (#12).
+# Generate a real one with: openssl rand -hex 32
 #auth.token = "YOUR_TOKEN"
 #[[auth.token_policies]]
 #token = "YOUR_TOKEN"

@@ -13,6 +13,12 @@ pub const TYPE_PING: u8 = b'G';
 pub const TYPE_PONG: u8 = b'g';
 pub const TYPE_UDP_PACKET: u8 = b'D';
 pub const TYPE_KICK_OUT: u8 = b'E';
+/// Server → Client: fresh single-use login challenge (#12).
+pub const TYPE_CHALLENGE: u8 = b'C';
+/// Client → Server: announce a newly opened stream and ask for a
+/// Challenge (#12). Empty on purpose — the stream itself is the
+/// announcement (see [`Hello`]).
+pub const TYPE_HELLO: u8 = b'H';
 
 // ── P2P direct-tunnel negotiation ────────────────────────────────────────────
 /// Client → Server: "I want a direct tunnel to `peer_session_id`"
@@ -37,8 +43,6 @@ pub struct Login {
     #[serde(default)]
     pub user: String,
     #[serde(default)]
-    pub auth_digest: String,
-    #[serde(default)]
     pub timestamp: i64,
     #[serde(default)]
     pub session_id: String,
@@ -48,7 +52,42 @@ pub struct Login {
     /// fresh login or when the client has no stored secret.
     #[serde(default)]
     pub resume_proof: String,
+    /// Answer to the server's Challenge for this connection (#12):
+    /// HMAC-SHA256(key=token) over "login", the challenge nonce and the
+    /// Login fields. Empty on an old client — the server rejects the
+    /// Login (hard cut); the timestamp-only `auth_digest` is gone.
+    #[serde(default)]
+    pub challenge_response: String,
+    /// Client-generated nonce (32 random bytes, hex) for the server's
+    /// mutual proof in LoginResp (#12).
+    #[serde(default)]
+    pub client_nonce: String,
+    /// Protocol capabilities this client speaks, e.g. "challenge-auth-v1"
+    /// (#12). The server records them; the challenge response binds them.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
+
+/// Server → Client: fresh single-use challenge for the login on this
+/// connection (#12). Sent immediately when a control or data stream
+/// opens; the client's Login answers it with `challenge_response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Challenge {
+    /// Hex-encoded 32 random bytes, issued fresh per connection.
+    pub nonce: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+/// Client → Server: announce a newly opened stream and ask for a
+/// Challenge (#12). Empty on purpose — the stream itself is the
+/// announcement. yamux 0.14 and quinn 0.11 open outbound streams
+/// lazily: the peer only learns of a stream when the opener writes
+/// to it. A client that only reads would deadlock — the server never
+/// sees the stream, so it never sends the Challenge — so the client
+/// always writes Hello first, on control and data streams alike.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Hello {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginResp {
@@ -63,6 +102,12 @@ pub struct LoginResp {
     /// proofs; empty when login failed.
     #[serde(default)]
     pub resume_token: String,
+    /// The server's mutual proof (#12): HMAC-SHA256(key=token) over
+    /// "login-resp", the client's nonce and the assigned session id. The
+    /// client verifies it before acting on any ReqDataConn/StartDataConn;
+    /// empty from an old server.
+    #[serde(default)]
+    pub server_proof: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -127,13 +172,10 @@ pub struct ReqDataConn {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewDataConn {
     pub session_id: String,
-    #[serde(default)]
-    pub auth_digest: String,
-    #[serde(default)]
-    pub timestamp: i64,
-    /// HMAC proof of the session secret, purpose `"data-conn"` (#11).
-    /// Required since #11; `auth_digest`/`timestamp` are kept as
-    /// transition fields and no longer authenticate anything.
+    /// HMAC proof of the session secret, purpose `"data-conn"` (#11),
+    /// bound to the fresh Challenge nonce of this stream (#12) instead
+    /// of a client-chosen timestamp — no replay window. The legacy
+    /// `auth_digest`/`timestamp` transition fields are gone.
     #[serde(default)]
     pub proof: String,
 }
@@ -153,13 +195,12 @@ pub struct StartDataConn {
     pub error: String,
 }
 
+/// Heartbeat, no payload (#12): the old `auth_digest`/`timestamp`
+/// fields are gone — the digest was the same timestamp-only HMAC as
+/// Login's, the server already ignored it, and a heartbeat proves
+/// nothing (the control stream itself is authenticated at login).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Ping {
-    #[serde(default)]
-    pub auth_digest: String,
-    #[serde(default)]
-    pub timestamp: i64,
-}
+pub struct Ping {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Pong {
@@ -311,6 +352,8 @@ mod b64_bytes {
 pub enum Message {
     Login(Login),
     LoginResp(LoginResp),
+    Challenge(Challenge),
+    Hello(Hello),
     NewTunnel(NewTunnel),
     NewTunnelResp(NewTunnelResp),
     CloseTunnel(CloseTunnel),
@@ -333,6 +376,8 @@ impl Message {
         match self {
             Self::Login(_) => TYPE_LOGIN,
             Self::LoginResp(_) => TYPE_LOGIN_RESP,
+            Self::Challenge(_) => TYPE_CHALLENGE,
+            Self::Hello(_) => TYPE_HELLO,
             Self::NewTunnel(_) => TYPE_NEW_TUNNEL,
             Self::NewTunnelResp(_) => TYPE_NEW_TUNNEL_RESP,
             Self::CloseTunnel(_) => TYPE_CLOSE_TUNNEL,

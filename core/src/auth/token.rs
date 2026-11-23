@@ -1,10 +1,19 @@
 use hmac::{Hmac, Mac};
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const DEFAULT_MAX_SKEW_SECS: i64 = 15 * 60;
+
+/// Fresh single-use nonce: 32 random bytes, lowercase hex-encoded (#12).
+/// Issued by the server once per connection (the Challenge) and by the
+/// client once per login (client_nonce, for the mutual proof).
+pub fn new_nonce() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    hex::encode(bytes)
+}
 
 /// Stable public id for a token: lowercase hex of SHA-256(token) (#11).
 /// Logs, API responses and policy lookups carry only this id; the raw
@@ -18,44 +27,18 @@ pub fn short_token_id(token: &str) -> String {
     token_id(token).chars().take(16).collect()
 }
 
-/// Match a login digest against the global token and every policy token
-/// (#11). Returns the matched token's id, or `None` when nothing matches.
-/// Each candidate is checked with the same constant-time verification as
-/// `verify_login_at`, so a wrong digest reveals nothing about any token.
-pub fn match_token_id(
-    global_token: &str,
-    policy_tokens: &[&str],
-    auth_digest: &str,
-    timestamp: i64,
-) -> Option<String> {
-    match_token_id_at(
-        global_token,
-        policy_tokens,
-        auth_digest,
-        timestamp,
-        unix_now(),
-        DEFAULT_MAX_SKEW_SECS,
-    )
-}
-
-/// Injectable-clock variant of [`match_token_id`] (unit-testable).
-pub fn match_token_id_at(
-    global_token: &str,
-    policy_tokens: &[&str],
-    auth_digest: &str,
-    timestamp: i64,
-    now: i64,
-    max_skew_secs: i64,
-) -> Option<String> {
-    if verify_login_at(global_token, auth_digest, timestamp, now, max_skew_secs) {
-        return Some(token_id(global_token));
-    }
-    for policy_token in policy_tokens {
-        if verify_login_at(policy_token, auth_digest, timestamp, now, max_skew_secs) {
-            return Some(token_id(policy_token));
-        }
-    }
-    None
+/// HMAC-SHA256(key=secret_hex bytes) over purpose, session id and one
+/// freshness value, newline-separated. Shared by the timestamp-based
+/// resume proof and the nonce-based data-conn proof (#12).
+fn session_proof_mac(secret_hex: &str, purpose: &str, session_id: &str, freshness: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret_hex.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(purpose.as_bytes());
+    mac.update(b"\n");
+    mac.update(session_id.as_bytes());
+    mac.update(b"\n");
+    mac.update(freshness.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Proof that the holder knows a session's secret (#11, shared with #12).
@@ -72,14 +55,34 @@ pub fn compute_session_proof(
     session_id: &str,
     timestamp: i64,
 ) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret_hex.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(purpose.as_bytes());
-    mac.update(b"\n");
-    mac.update(session_id.as_bytes());
-    mac.update(b"\n");
-    mac.update(timestamp.to_string().as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    session_proof_mac(secret_hex, purpose, session_id, &timestamp.to_string())
+}
+
+/// Nonce-bound variant (#12): the freshness value is the server-issued
+/// Challenge nonce for this stream, not a client-chosen timestamp, so a
+/// captured data-conn proof cannot be replayed on another connection
+/// (there is no skew window at all — the nonce is single-use).
+pub fn compute_session_proof_nonce(
+    secret_hex: &str,
+    purpose: &str,
+    session_id: &str,
+    nonce: &str,
+) -> String {
+    session_proof_mac(secret_hex, purpose, session_id, nonce)
+}
+
+pub fn verify_session_proof_nonce(
+    secret_hex: &str,
+    purpose: &str,
+    session_id: &str,
+    proof: &str,
+    nonce: &str,
+) -> bool {
+    if secret_hex.is_empty() || proof.is_empty() || nonce.is_empty() {
+        return false;
+    }
+    let expected = compute_session_proof_nonce(secret_hex, purpose, session_id, nonce);
+    constant_time_eq(expected.as_bytes(), proof.as_bytes())
 }
 
 pub fn verify_session_proof(
@@ -120,13 +123,152 @@ pub fn verify_session_proof_at(
     constant_time_eq(expected.as_bytes(), proof.as_bytes())
 }
 
-/// Compute the auth_digest as HMAC-SHA256(key=token, msg=timestamp).
-/// The result is lowercase hex-encoded (64 chars).
-pub fn compute_auth_digest(token: &str, timestamp: i64) -> String {
+/// The Login's challenge answer (#12): HMAC-SHA256(key=token) over the
+/// literal `"login"`, the server-issued Challenge nonce for this
+/// connection, and the Login fields that matter — session id, user,
+/// hostname, pool count, version and capabilities — newline-separated.
+/// Binding the fresh nonce makes a captured Login unreplayable on any
+/// other connection (the next connection gets a different nonce), and
+/// binding the fields makes tampering with any of them invalidate it.
+/// There is no timestamp and no skew window: freshness comes from the
+/// nonce, which the server issues once per connection and discards.
+///
+/// The parameter list is the Login's bound fields; bundling them into
+/// a new struct would be an abstraction for one call site.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_login_response(
+    token: &str,
+    nonce: &str,
+    session_id: &str,
+    user: &str,
+    hostname: &str,
+    pool_count: i32,
+    version: &str,
+    capabilities: &[String],
+) -> String {
     let mut mac =
         HmacSha256::new_from_slice(token.as_bytes()).expect("HMAC-SHA256 accepts any key length");
-    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b"login");
+    for field in [
+        nonce,
+        session_id,
+        user,
+        hostname,
+        &pool_count.to_string(),
+        version,
+        &capabilities.join(","),
+    ] {
+        mac.update(b"\n");
+        mac.update(field.as_bytes());
+    }
     hex::encode(mac.finalize().into_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_login_response(
+    token: &str,
+    response: &str,
+    nonce: &str,
+    session_id: &str,
+    user: &str,
+    hostname: &str,
+    pool_count: i32,
+    version: &str,
+    capabilities: &[String],
+) -> bool {
+    if token.is_empty() || response.is_empty() || nonce.is_empty() {
+        return false;
+    }
+    let expected = compute_login_response(
+        token,
+        nonce,
+        session_id,
+        user,
+        hostname,
+        pool_count,
+        version,
+        capabilities,
+    );
+    constant_time_eq(expected.as_bytes(), response.as_bytes())
+}
+
+/// Match a Login challenge response against the global token and every
+/// policy token (#11). Returns the matched token's id plus the matched
+/// token itself (needed to compute the mutual server proof); the raw
+/// token is never logged. `None` when nothing matches.
+#[allow(clippy::too_many_arguments)]
+pub fn match_login_response<'a>(
+    global_token: &'a str,
+    policy_tokens: &[&'a str],
+    response: &str,
+    nonce: &str,
+    session_id: &str,
+    user: &str,
+    hostname: &str,
+    pool_count: i32,
+    version: &str,
+    capabilities: &[String],
+) -> Option<(String, &'a str)> {
+    if verify_login_response(
+        global_token,
+        response,
+        nonce,
+        session_id,
+        user,
+        hostname,
+        pool_count,
+        version,
+        capabilities,
+    ) {
+        return Some((token_id(global_token), global_token));
+    }
+    for policy_token in policy_tokens {
+        if verify_login_response(
+            policy_token,
+            response,
+            nonce,
+            session_id,
+            user,
+            hostname,
+            pool_count,
+            version,
+            capabilities,
+        ) {
+            return Some((token_id(policy_token), policy_token));
+        }
+    }
+    None
+}
+
+/// The server's mutual proof (#12): HMAC-SHA256(key=token) over the
+/// literal `"login-resp"`, the client's nonce and the session id the
+/// server assigned. The client verifies it right after LoginResp,
+/// before acting on any ReqDataConn/StartDataConn — a server that does
+/// not know the token cannot make the client open a local connection.
+/// This is a second layer behind verified TLS, not a replacement: it
+/// does not stop an attacker who relays the exchange.
+pub fn compute_server_proof(token: &str, client_nonce: &str, session_id: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(token.as_bytes()).expect("HMAC-SHA256 accepts any key length");
+    mac.update(b"login-resp");
+    mac.update(b"\n");
+    mac.update(client_nonce.as_bytes());
+    mac.update(b"\n");
+    mac.update(session_id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn verify_server_proof(
+    token: &str,
+    proof: &str,
+    client_nonce: &str,
+    session_id: &str,
+) -> bool {
+    if token.is_empty() || proof.is_empty() || client_nonce.is_empty() || session_id.is_empty() {
+        return false;
+    }
+    let expected = compute_server_proof(token, client_nonce, session_id);
+    constant_time_eq(expected.as_bytes(), proof.as_bytes())
 }
 
 pub fn unix_now() -> i64 {
@@ -134,54 +276,6 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-pub fn verify_login(token: &str, auth_digest: &str, timestamp: i64) -> bool {
-    verify_login_at(
-        token,
-        auth_digest,
-        timestamp,
-        unix_now(),
-        DEFAULT_MAX_SKEW_SECS,
-    )
-}
-
-/// Alias kept for upstream API compatibility.
-pub fn verify_auth_digest(token: &str, auth_digest: &str, timestamp: i64) -> bool {
-    verify_login(token, auth_digest, timestamp)
-}
-
-/// Verification with injectable clock and skew window (unit-testable).
-///
-/// Security hardening over plain HMAC comparison:
-/// - rejects when token is empty (unconfigured server must deny all);
-/// - rejects non-positive timestamps;
-/// - rejects timestamps outside `max_skew_secs` of `now` (replay protection);
-/// - compares digests in constant time (timing side-channel protection).
-pub fn verify_login_at(
-    token: &str,
-    auth_digest: &str,
-    timestamp: i64,
-    now: i64,
-    max_skew_secs: i64,
-) -> bool {
-    // Reject when no token is configured — an unconfigured server must not
-    // grant access to any client.
-    if token.is_empty() {
-        return false;
-    }
-    if auth_digest.is_empty() {
-        return false;
-    }
-    if timestamp <= 0 {
-        return false;
-    }
-    if now.abs_diff(timestamp) > max_skew_secs as u64 {
-        return false;
-    }
-    // Constant-time comparison to prevent timing side-channels.
-    let expected = compute_auth_digest(token, timestamp);
-    constant_time_eq(expected.as_bytes(), auth_digest.as_bytes())
 }
 
 /// Constant-time byte slice comparison (prevents timing oracle).
@@ -200,56 +294,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_current_timestamp() {
-        let ts = 1_700_000_000;
-        let key = compute_auth_digest("secret", ts);
-        assert!(verify_login_at("secret", &key, ts, ts, 900));
-    }
-
-    #[test]
-    fn rejects_stale_timestamp() {
-        let ts = 1_700_000_000;
-        let key = compute_auth_digest("secret", ts);
-        assert!(!verify_login_at("secret", &key, ts, ts + 901, 900));
-    }
-
-    #[test]
-    fn empty_token_rejects() {
-        // Empty token: authentication must fail (no auth configured = deny all).
-        assert!(!verify_login_at(
-            "",
-            "whatever",
-            1_700_000_000,
-            1_700_000_000,
-            900
-        ));
-    }
-
-    #[test]
-    fn rejects_wrong_key() {
-        let ts = 1_700_000_000;
-        let key = compute_auth_digest("secret", ts);
-        // Flip one char — must reject.
-        let mut bad = key.clone();
-        let idx = bad.len() - 1;
-        let last = bad.as_bytes()[idx];
-        bad.replace_range(idx.., if last == b'a' { "b" } else { "a" });
-        assert!(!verify_login_at("secret", &bad, ts, ts, 900));
-    }
-
-    #[test]
-    fn rejects_zero_timestamp() {
-        let key = compute_auth_digest("secret", 0);
-        assert!(!verify_login_at("secret", &key, 0, 0, 900));
-    }
-
-    #[test]
-    fn rejects_empty_digest() {
-        let ts = 1_700_000_000;
-        assert!(!verify_login_at("secret", "", ts, ts, 900));
-    }
-
-    #[test]
     fn constant_time_eq_same() {
         assert!(constant_time_eq(b"hello", b"hello"));
     }
@@ -257,6 +301,15 @@ mod tests {
     #[test]
     fn constant_time_eq_diff_len() {
         assert!(!constant_time_eq(b"hello", b"hell"));
+    }
+
+    #[test]
+    fn new_nonce_is_32_random_bytes_hex() {
+        let a = new_nonce();
+        let b = new_nonce();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two nonces must differ");
     }
 
     // ── #11: token ids and session proofs ──────────────────────────────────
@@ -272,36 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn match_token_id_matches_global_and_policy_tokens() {
-        let ts = 1_700_000_000;
-        let global = compute_auth_digest("global-token", ts);
-        assert_eq!(
-            match_token_id_at("global-token", &["policy-token"], &global, ts, ts, 900),
-            Some(token_id("global-token"))
-        );
-        let policy = compute_auth_digest("policy-token", ts);
-        assert_eq!(
-            match_token_id_at("global-token", &["policy-token"], &policy, ts, ts, 900),
-            Some(token_id("policy-token"))
-        );
-    }
-
-    #[test]
-    fn match_token_id_rejects_unknown_and_empty_tokens() {
-        let ts = 1_700_000_000;
-        let wrong = compute_auth_digest("no-such-token", ts);
-        assert_eq!(
-            match_token_id_at("global-token", &["policy-token"], &wrong, ts, ts, 900),
-            None
-        );
-        // An empty global token never matches, even with an empty digest.
-        assert_eq!(
-            match_token_id_at("", &[], "", ts, ts, 900),
-            None
-        );
-    }
-
-    #[test]
     fn session_proof_binds_purpose_session_and_time() {
         let secret = "ab".repeat(32); // 64 hex chars, stands in for a real secret
         let ts = 1_700_000_000;
@@ -314,5 +337,105 @@ mod tests {
         assert!(!verify_session_proof_at(&secret, "resume", "sess-1", &proof, ts, ts + 901, 900));
         assert!(!verify_session_proof_at("", "resume", "sess-1", &proof, ts, ts, 900));
         assert!(!verify_session_proof_at(&secret, "resume", "sess-1", "", ts, ts, 900));
+    }
+
+    // ── #12: challenge-response binding ────────────────────────────────────
+
+    fn login_args() -> (String, &'static str, &'static str, &'static str, i32, &'static str, Vec<String>) {
+        // (nonce, session_id, user, hostname, pool_count, version, capabilities)
+        (
+            "aa".repeat(32),
+            "sess-1",
+            "alice",
+            "host-1",
+            2,
+            "0.2.0",
+            vec!["challenge-auth-v1".to_string()],
+        )
+    }
+
+    #[test]
+    fn login_response_binds_every_field() {
+        let (nonce, sid, user, host, pool, ver, caps) = login_args();
+        let resp = compute_login_response("secret", &nonce, sid, user, host, pool, ver, &caps);
+        assert!(verify_login_response("secret", &resp, &nonce, sid, user, host, pool, ver, &caps));
+        // Tampering with any single bound field invalidates the response.
+        assert!(!verify_login_response("secret", &resp, &nonce, "sess-2", user, host, pool, ver, &caps));
+        assert!(!verify_login_response("secret", &resp, &nonce, sid, "mallory", host, pool, ver, &caps));
+        assert!(!verify_login_response("secret", &resp, &nonce, sid, user, "host-2", pool, ver, &caps));
+        assert!(!verify_login_response("secret", &resp, &nonce, sid, user, host, pool + 1, ver, &caps));
+        assert!(!verify_login_response("secret", &resp, &nonce, sid, user, host, pool, "0.1.0", &caps));
+        assert!(!verify_login_response("secret", &resp, &nonce, sid, user, host, pool, ver, &[]));
+        // Wrong token, empty token/response/nonce all fail.
+        assert!(!verify_login_response("other", &resp, &nonce, sid, user, host, pool, ver, &caps));
+        assert!(!verify_login_response("", &resp, &nonce, sid, user, host, pool, ver, &caps));
+        assert!(!verify_login_response("secret", "", &nonce, sid, user, host, pool, ver, &caps));
+        assert!(!verify_login_response("secret", &resp, "", sid, user, host, pool, ver, &caps));
+    }
+
+    #[test]
+    fn login_response_cannot_replay_on_another_connection() {
+        // A captured response is bound to the nonce of its own
+        // connection; the next connection gets a different nonce.
+        let (nonce, sid, user, host, pool, ver, caps) = login_args();
+        let resp = compute_login_response("secret", &nonce, sid, user, host, pool, ver, &caps);
+        let other_nonce = "bb".repeat(32);
+        assert_ne!(nonce, other_nonce);
+        assert!(!verify_login_response("secret", &resp, &other_nonce, sid, user, host, pool, ver, &caps));
+    }
+
+    #[test]
+    fn match_login_response_matches_global_and_policy_tokens() {
+        let (nonce, sid, user, host, pool, ver, caps) = login_args();
+        let global = compute_login_response("global-token", &nonce, sid, user, host, pool, ver, &caps);
+        assert_eq!(
+            match_login_response("global-token", &["policy-token"], &global, &nonce, sid, user, host, pool, ver, &caps),
+            Some((token_id("global-token"), "global-token"))
+        );
+        let policy = compute_login_response("policy-token", &nonce, sid, user, host, pool, ver, &caps);
+        assert_eq!(
+            match_login_response("global-token", &["policy-token"], &policy, &nonce, sid, user, host, pool, ver, &caps),
+            Some((token_id("policy-token"), "policy-token"))
+        );
+    }
+
+    #[test]
+    fn match_login_response_rejects_unknown_and_empty_tokens() {
+        let (nonce, sid, user, host, pool, ver, caps) = login_args();
+        let wrong = compute_login_response("no-such-token", &nonce, sid, user, host, pool, ver, &caps);
+        assert_eq!(
+            match_login_response("global-token", &["policy-token"], &wrong, &nonce, sid, user, host, pool, ver, &caps),
+            None
+        );
+        assert_eq!(
+            match_login_response("", &[], "", &nonce, sid, user, host, pool, ver, &caps),
+            None
+        );
+    }
+
+    #[test]
+    fn server_proof_binds_client_nonce_and_session() {
+        let proof = compute_server_proof("secret", "client-nonce", "sess-1");
+        assert!(verify_server_proof("secret", &proof, "client-nonce", "sess-1"));
+        assert!(!verify_server_proof("secret", &proof, "other-nonce", "sess-1"));
+        assert!(!verify_server_proof("secret", &proof, "client-nonce", "sess-2"));
+        assert!(!verify_server_proof("other", &proof, "client-nonce", "sess-1"));
+        assert!(!verify_server_proof("secret", "", "client-nonce", "sess-1"));
+        assert!(!verify_server_proof("", &proof, "client-nonce", "sess-1"));
+    }
+
+    #[test]
+    fn session_proof_nonce_binds_nonce_not_timestamp() {
+        let secret = "ab".repeat(32);
+        let proof = compute_session_proof_nonce(&secret, "data-conn", "sess-1", "nonce-1");
+        assert!(verify_session_proof_nonce(&secret, "data-conn", "sess-1", &proof, "nonce-1"));
+        // A proof captured for one connection's nonce is useless on the
+        // next connection: there is no skew window to replay inside.
+        assert!(!verify_session_proof_nonce(&secret, "data-conn", "sess-1", &proof, "nonce-2"));
+        assert!(!verify_session_proof_nonce(&secret, "resume", "sess-1", &proof, "nonce-1"));
+        assert!(!verify_session_proof_nonce(&secret, "data-conn", "sess-2", &proof, "nonce-1"));
+        assert!(!verify_session_proof_nonce("", "data-conn", "sess-1", &proof, "nonce-1"));
+        assert!(!verify_session_proof_nonce(&secret, "data-conn", "sess-1", "", "nonce-1"));
+        assert!(!verify_session_proof_nonce(&secret, "data-conn", "sess-1", &proof, ""));
     }
 }

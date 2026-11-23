@@ -126,11 +126,19 @@ pub struct ClientTlsConfig {
     #[serde(default, rename = "serverName", alias = "server_name")]
     pub server_name: String,
     /// H1 (TOFU): path to the server certificate fingerprint store. When set
-    /// (and no trustedCaFile), the client pins the server's SPKI hash on first
-    /// connect and refuses connections if it ever changes. Empty = legacy
-    /// insecure skip-verify behaviour (kept for backward compatibility).
+    /// (and no trustedCaFile), the client pins the whole server certificate
+    /// (SHA-256 of the DER) on first connect and refuses connections if it
+    /// ever changes. Empty = legacy insecure skip-verify behaviour (kept
+    /// for backward compatibility).
     #[serde(default, rename = "tofuStoreFile", alias = "tofu_store_file")]
     pub tofu_store_file: String,
+    /// #12: explicit opt-in to skip server-certificate verification
+    /// (the old default). Default false: with TLS on and neither a
+    /// trusted CA nor a TOFU store configured, the client refuses to
+    /// connect instead of silently trusting any server. Set it only on
+    /// networks you control; skipped verification is a MITM hole.
+    #[serde(default, rename = "insecureSkipVerify", alias = "insecure_skip_verify")]
+    pub insecure_skip_verify: bool,
 }
 
 impl Default for ClientTlsConfig {
@@ -142,6 +150,7 @@ impl Default for ClientTlsConfig {
             trusted_ca_file: String::new(),
             server_name: String::new(),
             tofu_store_file: String::new(),
+            insecure_skip_verify: false,
         }
     }
 }
