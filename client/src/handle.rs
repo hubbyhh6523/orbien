@@ -158,6 +158,10 @@ impl ClientHandle {
     pub async fn run_foreground(self, mut cfg: ClientConfig, config_path: PathBuf) -> Result<()> {
         cfg.prepare_runtime(&config_path);
         crate::check_config(&cfg)?;
+        // #12: verify-by-default is a config error, not a retryable dial
+        // failure — refuse to start instead of looping in reconnect
+        // backoff with the reason hidden in the (desktop-only) log queue.
+        crate::connector::require_server_trust(&cfg)?;
         let cancel = CancellationToken::new();
         self.set_status(ClientStatus::Starting);
         self.set_error(None);
