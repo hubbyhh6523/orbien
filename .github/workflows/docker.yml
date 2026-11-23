@@ -62,6 +62,10 @@ jobs:
             '[auth]' \
             "token = \"${DOCKER_SMOKE_TOKEN}\"" \
             '' \
+            '# #12: smoke server uses a self-signed cert; no CA/TOFU.' \
+            '[transport.tls]' \
+            'insecureSkipVerify = true' \
+            '' \
             '[[tunnels]]' \
             'name       = "echo"' \
             'protocol   = "tcp"' \
