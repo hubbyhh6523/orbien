@@ -127,6 +127,7 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn test_cfg(config_file: &Path) -> ServerConfig {
@@ -158,6 +159,7 @@ mod tests {
         let first_key = fs::read(&key_path).unwrap();
         assert!(!first_cert.is_empty() && !first_key.is_empty());
         // Key is owner-only on Unix.
+        #[cfg(unix)]
         assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
 
         // A fresh config (restart) reloads the same pair, not a new one.
