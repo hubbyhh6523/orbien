@@ -19,6 +19,11 @@ pub const SERVER_DATA_READ_DEADLINE: Duration = Duration::from_secs(60);
 const VISITOR_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// At most one drop-summary log line per interval, per log owner.
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Winsock `WSAEMSGSIZE`: a datagram larger than the receive buffer.
+/// `recv_from` on Windows reports it as an error (the datagram is
+/// already consumed); Linux truncates silently instead. The value can
+/// never occur as a Unix errno, so the check is portable.
+const WSAEMSGSIZE: i32 = 10040;
 
 /// Fixed reasons for UDP drops (#14). Each maps to one
 /// `limit_rejections` metric key; see `ServerSnapshot::limit_rejections`.
@@ -311,6 +316,14 @@ pub async fn forward_user_conn(
                 drops.note(UdpDropReason::RecvReset);
                 continue;
             }
+            Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
+                // #14: on Windows an oversized datagram is a receive
+                // error, not a truncated read; the datagram is already
+                // consumed, so count it and keep the loop alive.
+                (hooks.on_drop)(UdpDropReason::Truncated);
+                drops.note(UdpDropReason::Truncated);
+                continue;
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "udp local→data read ended");
                 break;
@@ -468,6 +481,13 @@ async fn writer_fn(ctx: LocalReaderCtx) {
                 if ctx.send_tx.try_send(Message::UdpPacket(pkt)).is_err() {
                     break;
                 }
+            }
+            Ok(Err(e)) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
+                // #14: on Windows an oversized reply is a receive error,
+                // not a truncated read; drop it and keep this visitor's
+                // forwarding alive.
+                tracing::trace!(remote = %ctx.remote, "udp reply larger than buffer; drop");
+                continue;
             }
             Ok(Err(_)) | Err(_) => break,
         }

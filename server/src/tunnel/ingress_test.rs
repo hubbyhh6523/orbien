@@ -443,9 +443,13 @@ async fn udp_forward_session_cap_enforced() {
 
 #[tokio::test]
 async fn udp_forward_send_error_does_not_kill_writer() {
-    // #14: a failed `send_to` (port 0) drops that datagram only; later
-    // replies of other visitors are still delivered. CI-only: the VM
-    // blocks UDP sendto.
+    // #14: a failed `send_to` drops that datagram only; later replies
+    // of other visitors are still delivered. The failure is triggered
+    // with a reply larger than the max UDP payload (EMSGSIZE) to a
+    // visitor the table knows: a reply to an unknown address would be
+    // dropped as NoVisitor before any send is attempted, and a port-0
+    // address can never be a tracked visitor. CI-only: the VM blocks
+    // UDP sendto.
     let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = sock.local_addr().unwrap();
     let counters = Arc::new(HookCounters::default());
@@ -458,10 +462,13 @@ async fn udp_forward_send_error_does_not_kill_writer() {
     let got = tokio::time::timeout(Duration::from_secs(2), send_rx.recv()).await;
     got.expect("visitor datagram must be forwarded")
         .expect("channel open");
-    // Reply 1: port 0 cannot be sent to.
-    let bad: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Reply 1: 70000 bytes exceeds the max UDP payload, so `send_to`
+    // fails.
     read_tx
-        .send(orbien_core::msg::UdpPacket::new(b"bad".to_vec(), Some(bad)))
+        .send(orbien_core::msg::UdpPacket::new(
+            vec![0u8; 70_000],
+            Some(visitor_addr),
+        ))
         .await
         .unwrap();
     // Reply 2: the real visitor must still get its reply.
