@@ -194,3 +194,19 @@ async fn reload_api_allowed_domains_accepted() {
         .authorize_domains(&token_id("dom-token"), &["evil.com".to_string()], "other.test")
         .is_err());
 }
+
+/// #15: a reload that changes only `denySrcCidrs` swaps the live policy,
+/// so a previously allowed address is denied for new connections.
+#[tokio::test]
+async fn reload_api_deny_src_cidrs_swap_applies() {
+    let state = state();
+    let before = state.svc.access_policy().await;
+    assert!(!before.is_denied("127.0.0.1".parse().unwrap()));
+    let file = ConfigFile::new("denySrcCidrs = ['127.0.0.1/32']\n");
+    let result = reload(Arc::clone(&state), Some(&file.0)).await;
+    assert_eq!(result["code"], 200, "{result}");
+    let after = state.svc.access_policy().await;
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert!(after.is_denied("127.0.0.1".parse().unwrap()));
+    assert!(!after.is_denied("127.0.0.2".parse().unwrap()));
+}

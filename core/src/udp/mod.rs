@@ -1,6 +1,6 @@
 use crate::msg::{Message, Ping, UdpPacket, UdpSocketAddr};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -18,6 +18,7 @@ pub async fn forward_user_conn(
     send_tx: mpsc::Sender<UdpPacket>,
     buf_size: usize,
     max_sessions: usize,
+    is_denied: Arc<dyn Fn(IpAddr) -> bool + Send + Sync>,
 ) {
     let udp_w = Arc::clone(&udp);
     let writer = tokio::spawn(async move {
@@ -37,6 +38,12 @@ pub async fn forward_user_conn(
     loop {
         match udp.recv_from(&mut buf).await {
             Ok((n, remote)) => {
+                // #15: deny before the session map — a denied source
+                // must not consume a #14 session slot.
+                if is_denied(remote.ip()) {
+                    tracing::trace!(%remote, "udp packet from denied source; drop");
+                    continue;
+                }
                 if max_sessions > 0 {
                     let now = Instant::now();
                     let mut map = seen.lock().await;

@@ -5,12 +5,13 @@ use anyhow::Result;
 use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use orbien_core::msg::{self, Message, UdpPacket};
 use orbien_core::udp::{forward_user_conn, CHANNEL_CAP, SERVER_DATA_READ_DEADLINE};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -21,15 +22,16 @@ pub struct UdpTunnel {
     notify: Arc<Notify>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 
-    /// Access policy, kept for the source checks of #15 (no behavior
-    /// change in #11; stored so the tunnel does not need re-plumbing).
-    _access: Arc<AccessPolicy>,
+    /// Live access policy (#15): the deny check in `forward_user_conn`
+    /// reads it per datagram through a closure, so reloads apply to
+    /// existing tunnels.
+    _access: Arc<RwLock<Arc<AccessPolicy>>>,
 
     _udp: Arc<UdpSocket>,
 }
 
 impl UdpTunnel {
-    // #11: 8 args — `access` is the policy for the #15 source checks.
+    // #11: 8 args — `access` is the live policy for the #15 source checks.
     // Kept explicit (rather than re-reading it off `control`) so the
     // tunnel's policy dependency is visible at the call site.
     #[allow(clippy::too_many_arguments)]
@@ -41,7 +43,7 @@ impl UdpTunnel {
         limiter: Option<Arc<BandwidthLimiter>>,
         packet_size: usize,
         max_connections: usize,
-        access: Arc<AccessPolicy>,
+        access: Arc<RwLock<Arc<AccessPolicy>>>,
     ) -> Result<Self> {
         let addr = format!("{bind_addr}:{remote_port}");
         let udp = Arc::new(UdpSocket::bind(&addr).await?);
@@ -49,6 +51,19 @@ impl UdpTunnel {
 
         let closed = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
+
+        // #15: the deny check needs the live policy, but
+        // `forward_user_conn` lives in core and cannot name the
+        // server's `AccessPolicy` — hand it a closure over the live
+        // lock instead. `try_read`, not `blocking_read` (that panics
+        // inside a runtime task): a contended read only happens while
+        // a reload swaps the `Arc`, so fail closed for that instant.
+        let access_f = Arc::clone(&access);
+        let is_denied: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
+            Arc::new(move |ip| match access_f.try_read() {
+                Ok(policy) => policy.is_denied(ip),
+                Err(_) => true,
+            });
 
         let (send_tx, send_rx) = mpsc::channel::<UdpPacket>(CHANNEL_CAP);
         let (read_tx, read_rx) = mpsc::channel::<UdpPacket>(CHANNEL_CAP);
@@ -61,7 +76,7 @@ impl UdpTunnel {
             tasks.push(tokio::spawn(async move {
                 tokio::select! {
                     _ = notify_f.notified() => {}
-                    _ = forward_user_conn(udp_f, read_rx, send_tx, packet_size, max_connections) => {}
+                    _ = forward_user_conn(udp_f, read_rx, send_tx, packet_size, max_connections, is_denied) => {}
                 }
             }));
         }

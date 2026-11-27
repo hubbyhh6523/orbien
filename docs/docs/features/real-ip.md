@@ -60,3 +60,9 @@ denySrcCidrs = ["1.2.3.4/32"]
 | `proxyProtocolTrustedCidrs` | 否  |         | 信任的上游 CIDR；空则不解析 PP 头 |
 | `proxyProtocolTimeoutSecs`  | 否  | `5`     | 读取 PP 头超时（秒）              |
 | `denySrcCidrs`              | 否  |         | 拒绝的访客源 CIDR               |
+
+## 适用范围
+
+- `denySrcCidrs`：对 TCP/UDP 隧道、控制端口（TCP/KCP/QUIC/WebSocket）和 HTTP/HTTPS 网关的访客都生效；被拒的访客在请求数据连接之前就被关闭。
+- `proxyProtocol`：只在 TCP/HTTP/HTTPS 网关上解析上游 PP 头；控制端口和 UDP 不解析。不可信来源发来的 PP 头会被忽略。
+- 访客 IP 以 PP 头里的为准（只认受信任上游发来的）；HTTP 网关按该访客 IP 注入 `X-Forwarded-For`。

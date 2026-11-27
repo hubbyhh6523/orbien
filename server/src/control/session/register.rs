@@ -122,7 +122,7 @@ impl Control {
             remote_port,
             control,
             limiter,
-            self.access_policy().await,
+            Arc::clone(&self.access),
         )
         .await?;
         let remote_addr = format!(":{}", remote_port);
@@ -280,7 +280,7 @@ impl Control {
             limiter,
             packet_size,
             max_connections,
-            self.access_policy().await,
+            Arc::clone(&self.access),
         )
         .await?;
         let remote_addr = format!(":{}", remote_port);

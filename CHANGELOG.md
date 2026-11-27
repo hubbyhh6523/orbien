@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Security
+- **denySrcCidrs 与 PROXY Protocol 现在真正生效**（#15）：两者之前只存在于配置与死代码中，从未对任何监听器生效。现在 `denySrcCidrs` 对 TCP/UDP 隧道、控制端口（TCP/KCP/QUIC/WebSocket）和 HTTP/HTTPS 网关的访客都生效，被拒连接在请求数据连接之前关闭；`proxyProtocol` 对 TCP/HTTP/HTTPS 网关生效，控制端口与 UDP 不解析 PP 头，不可信来源发来的 PP 头会被忽略。**行为变更**：已有 `denySrcCidrs` 配置的部署升级后会开始真正拦截；已开启 `proxyProtocol` 的部署，日志 / `X-Forwarded-For` / 客户端看到的访客 IP 将从上游地址变为 PP 头里的真实访客 IP。
+- 移除未接入模块树的死代码 `server/src/proxy/`（http/mod/vhost）；其逻辑已由 `server/src/access/mod.rs` 的 `prepare_ingress` 统一实现。
+
 ## [0.2.0] - 2026-08-26
 
 ### Added

@@ -22,7 +22,7 @@ impl Service {
         let mut tunnel_type_count: BTreeMap<String, usize> = BTreeMap::new();
         let mut online_ids = std::collections::HashSet::new();
 
-        for (_, ctrl) in controls.iter() {
+        for ctrl in controls.values() {
             let tunnel_count = ctrl.tunnel_count().await;
             online_ids.insert(ctrl.session_id.clone());
             let mut active_connections = 0usize;

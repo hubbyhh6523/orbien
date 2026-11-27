@@ -12,6 +12,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
 impl Service {
+    /// #15: deny-list check for control listeners. A denied peer is
+    /// closed at once and must not consume a pre-login slot, so call
+    /// this before `pre_login.try_acquire` (TCP/KCP) or before the
+    /// permit re-key (QUIC, where the peer is known only after the
+    /// handshake).
+    async fn denied_by_policy(&self, peer: SocketAddr) -> bool {
+        if self.access.read().await.is_denied(peer.ip()) {
+            self.metrics.inc_limit_reject("deny_src_cidrs");
+            tracing::debug!(%peer, "denied by denySrcCidrs; closing connection");
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) async fn run_tcp(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         // #13: an accept error (e.g. EMFILE) backs off and retries
         // instead of ending the server.
@@ -27,6 +42,10 @@ impl Service {
                     continue;
                 }
             };
+            if self.denied_by_policy(peer).await {
+                drop(stream);
+                continue;
+            }
             let Some(permit) = self.pre_login.try_acquire(peer.ip()) else {
                 // #13: over the pre-login cap — close at once, no task.
                 self.metrics.inc_limit_reject("pre_login_cap");
@@ -142,6 +161,10 @@ impl Service {
                 }
             };
             tracing::debug!(%peer, transport = "kcp", "incoming connection");
+            if self.denied_by_policy(peer).await {
+                drop(stream);
+                continue;
+            }
             let Some(permit) = self.pre_login.try_acquire(peer.ip()) else {
                 self.metrics.inc_limit_reject("pre_login_cap");
                 tracing::debug!(%peer, "pre-login cap reached; closing connection");
@@ -217,6 +240,12 @@ impl Service {
         // unspecified bucket. The global count is unchanged by the swap
         // (one slot freed, one taken).
         let peer = conn.remote_address();
+        // #15: deny before the re-key, so a denied peer never takes a
+        // per-IP slot; the unspecified permit drops with the early return.
+        if self.denied_by_policy(peer).await {
+            conn.close(0u32.into(), b"denied by denySrcCidrs");
+            return Err(anyhow!("peer {peer} denied by denySrcCidrs"));
+        }
         let Some(real) = self.pre_login.try_acquire(peer.ip()) else {
             self.metrics.inc_limit_reject("pre_login_cap");
             conn.close(0u32.into(), b"pre-login cap reached");
@@ -353,5 +382,25 @@ fn yamux_err(e: anyhow::Error, peer: SocketAddr) -> anyhow::Error {
         )
     } else {
         anyhow!("yamux session {peer}: {e}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbien_core::config::ServerConfig;
+
+    /// #15: the control-port deny check reads the live policy.
+    #[tokio::test]
+    async fn denied_by_policy_uses_live_policy() {
+        let mut cfg = ServerConfig::default();
+        cfg.deny_src_cidrs = vec!["127.0.0.1/32".into()];
+        let svc = Arc::new(Service::new(cfg).expect("default config"));
+        assert!(svc
+            .denied_by_policy("127.0.0.1:12345".parse().unwrap())
+            .await);
+        assert!(!svc
+            .denied_by_policy("127.0.0.2:12345".parse().unwrap())
+            .await);
     }
 }
