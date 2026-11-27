@@ -6,7 +6,7 @@ use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 pub struct TcpTunnel {
@@ -27,7 +27,7 @@ impl TcpTunnel {
         remote_port: u16,
         control: Arc<Control>,
         limiter: Option<Arc<BandwidthLimiter>>,
-        access: Arc<AccessPolicy>,
+        access: Arc<RwLock<Arc<AccessPolicy>>>,
     ) -> Result<Self> {
         let addr = format!("{bind_addr}:{remote_port}");
         let listener = TcpListener::bind(&addr).await?;
@@ -65,7 +65,10 @@ impl TcpTunnel {
                                 };
                                 let pname = tunnel_name.clone();
                                 let lim = limiter_spawn.clone();
-                                let access = Arc::clone(&access);
+                                // #15: snapshot the live policy per
+                                // connection, so a reload applies to new
+                                // connections of existing tunnels.
+                                let access = Arc::clone(&*access.read().await);
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_ingress(
                                         ctl,

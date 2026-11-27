@@ -1,8 +1,3 @@
-// Some access-policy helpers (CIDR checks, proxy-protocol visitors, token
-// connection accounting) are wiring points not yet referenced by every build
-// path; keep them without tripping `-D warnings`.
-#![allow(dead_code)]
-
 use anyhow::{bail, Result};
 use orbien_core::auth;
 use orbien_core::net::{try_consume_proxy_protocol, PpConsume, PROXY_PROTOCOL_MAX_HEADER};
@@ -12,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenAccessPolicy {
@@ -107,11 +102,13 @@ impl AccessPolicy {
     }
 
     pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        let ip = normalize_ip(ip);
         !self.trusted_proxy_cidrs.is_empty()
             && self.trusted_proxy_cidrs.iter().any(|c| c.contains(ip))
     }
 
     pub fn is_denied(&self, ip: IpAddr) -> bool {
+        let ip = normalize_ip(ip);
         !self.deny_src_cidrs.is_empty() && self.deny_src_cidrs.iter().any(|c| c.contains(ip))
     }
 
@@ -262,6 +259,17 @@ fn normalize_domain_pattern(entry: &str) -> Result<String> {
     Ok(e)
 }
 
+/// Normalize an address for policy matching: an IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`) matches IPv4 rules (#15). `to_ipv4_mapped`
+/// is `Ipv6Addr`-only on older toolchains, so match explicitly instead
+/// of `IpAddr::to_ipv4_mapped` (CI pins Rust 1.92).
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 pub struct IngressConn {
     pub stream: PrefixedStream<TcpStream>,
     pub peer: SocketAddr,
@@ -269,17 +277,21 @@ pub struct IngressConn {
     pub local: Option<SocketAddr>,
 }
 
+/// #15: every gateway listener runs through here, so deny/PROXY handling
+/// lives in `prepare_visitor` and this is a thin mapping (`source` is the
+/// visitor the header names, or the peer when there is none). A bail here
+/// closes the connection before any data connection is requested.
 pub async fn prepare_ingress(
     stream: TcpStream,
     peer: SocketAddr,
-    _policy: &AccessPolicy,
+    policy: &AccessPolicy,
 ) -> Result<IngressConn> {
-    let local = stream.local_addr().ok();
+    let v = prepare_visitor(stream, peer, policy).await?;
     Ok(IngressConn {
-        stream: PrefixedStream::new(Vec::new(), stream),
-        peer,
-        source: peer,
-        local,
+        stream: v.stream,
+        peer: v.peer,
+        source: v.visitor,
+        local: v.local,
     })
 }
 
@@ -326,6 +338,10 @@ async fn read_optional_pp(
 ) -> Result<(PrefixedStream<TcpStream>, SocketAddr)> {
     let mut buf = vec![0u8; PROXY_PROTOCOL_MAX_HEADER];
     let mut filled = 0usize;
+    // #15: one total deadline from the first read, not a per-read
+    // timeout — a peer dripping one byte at a time must not hold the
+    // connection open indefinitely.
+    let deadline = Instant::now() + hdr_timeout;
 
     loop {
         match try_consume_proxy_protocol(&buf[..filled])? {
@@ -347,7 +363,8 @@ async fn read_optional_pp(
                 if filled >= buf.len() {
                     bail!("PROXY protocol header incomplete / too large");
                 }
-                let n = timeout(hdr_timeout, stream.read(&mut buf[filled..]))
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let n = timeout(remaining, stream.read(&mut buf[filled..]))
                     .await
                     .map_err(|_| anyhow::anyhow!("timeout waiting for PROXY protocol header"))??;
                 if n == 0 {
@@ -701,5 +718,169 @@ mod tests {
             err.to_string().contains("invalid allowed_domains pattern"),
             "{err}"
         );
+    }
+
+    // ── #15: deny / PROXY protocol ─────────────────────────────────────
+
+    use super::{prepare_ingress, Cidr};
+    use std::net::SocketAddr;
+    use tokio::io::AsyncWriteExt;
+
+    fn policy_15(deny: &[&str], pp: bool, trusted: &[&str], timeout: Duration) -> AccessPolicy {
+        let mut p = base_policy();
+        p.proxy_protocol = pp;
+        p.trusted_proxy_cidrs = trusted.iter().map(|s| Cidr::parse(s).unwrap()).collect();
+        p.deny_src_cidrs = deny.iter().map(|s| Cidr::parse(s).unwrap()).collect();
+        p.pp_header_timeout = timeout;
+        p
+    }
+
+    /// Connected loopback pair; returns (client, server) streams.
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            listener.accept()
+        );
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    #[test]
+    fn deny_matches_ipv4_mapped_ipv6() {
+        let p = policy_15(&["1.2.3.4/32"], false, &[], Duration::from_secs(1));
+        assert!(p.is_denied("::ffff:1.2.3.4".parse().unwrap()));
+        assert!(!p.is_denied("::ffff:1.2.3.5".parse().unwrap()));
+        // A v6 rule never matches a v4 address and vice versa.
+        let p6 = policy_15(&["::1/128"], false, &[], Duration::from_secs(1));
+        assert!(!p6.is_denied("127.0.0.1".parse().unwrap()));
+        assert!(p6.is_denied("::1".parse().unwrap()));
+        // Trusted-proxy matching normalizes the same way.
+        let t = policy_15(&[], true, &["10.0.0.0/8"], Duration::from_secs(1));
+        assert!(t.is_trusted_proxy("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!t.is_trusted_proxy("::ffff:192.168.1.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_denied_peer_errors() {
+        let (_client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        let p = policy_15(&["127.0.0.1/32"], false, &[], Duration::from_secs(1));
+        let err = match prepare_ingress(server, peer, &p).await {
+            Ok(_) => panic!("expected prepare_ingress to fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("denied by denySrcCidrs"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_trusted_pp_v1_sets_visitor() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        client
+            .write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 1234 80\r\nGET / HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let p = policy_15(&[], true, &["127.0.0.1/32"], Duration::from_secs(1));
+        let ingress = prepare_ingress(server, peer, &p).await.unwrap();
+        assert_eq!(ingress.source.ip().to_string(), "203.0.113.7");
+        assert_eq!(ingress.source.port(), 1234);
+        assert_eq!(ingress.peer, peer);
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_trusted_pp_v2_sets_visitor() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        let src: SocketAddr = "203.0.113.7:1234".parse().unwrap();
+        let dst: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let hdr =
+            orbien_core::net::build_proxy_protocol_header(src, dst, "v2").unwrap();
+        client.write_all(&hdr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let p = policy_15(&[], true, &["127.0.0.1/32"], Duration::from_secs(1));
+        let ingress = prepare_ingress(server, peer, &p).await.unwrap();
+        assert_eq!(ingress.source, src);
+        assert_eq!(ingress.peer, peer);
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_untrusted_pp_ignored() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        client
+            .write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 1234 80\r\n")
+            .await
+            .unwrap();
+        let p = policy_15(&[], true, &["10.0.0.0/8"], Duration::from_secs(1));
+        let ingress = prepare_ingress(server, peer, &p).await.unwrap();
+        assert_eq!(ingress.source, peer, "untrusted PP header must be ignored");
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_pp_unknown_falls_back_to_peer() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        client.write_all(b"PROXY UNKNOWN\r\n").await.unwrap();
+        let p = policy_15(&[], true, &["127.0.0.1/32"], Duration::from_secs(1));
+        let ingress = prepare_ingress(server, peer, &p).await.unwrap();
+        assert_eq!(ingress.source, peer);
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_denied_visitor_in_header_errors() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        client
+            .write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 1234 80\r\n")
+            .await
+            .unwrap();
+        let p = policy_15(
+            &["203.0.113.7/32"],
+            true,
+            &["127.0.0.1/32"],
+            Duration::from_secs(1),
+        );
+        let err = match prepare_ingress(server, peer, &p).await {
+            Ok(_) => panic!("expected prepare_ingress to fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("denied by denySrcCidrs"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_stalled_header_times_out() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        // Partial header, then stall: the client socket stays open, so
+        // only the total deadline can end this.
+        client.write_all(b"PROXY TCP4 203.0.113").await.unwrap();
+        let p = policy_15(&[], true, &["127.0.0.1/32"], Duration::from_millis(100));
+        let start = tokio::time::Instant::now();
+        let err = match prepare_ingress(server, peer, &p).await {
+            Ok(_) => panic!("expected prepare_ingress to fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must fail on the deadline, not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_ingress_oversized_header_errors() {
+        let (mut client, server) = tcp_pair().await;
+        let peer = server.peer_addr().unwrap();
+        // A v1 line with no CRLF past 108 bytes is rejected by the
+        // parser; the 256-byte buffer bound is the backstop.
+        client.write_all(b"PROXY ").await.unwrap();
+        client.write_all(&[b'X'; 200]).await.unwrap();
+        let p = policy_15(&[], true, &["127.0.0.1/32"], Duration::from_secs(1));
+        let err = match prepare_ingress(server, peer, &p).await {
+            Ok(_) => panic!("expected prepare_ingress to fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no CRLF"), "{err}");
     }
 }

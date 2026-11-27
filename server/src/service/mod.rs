@@ -68,6 +68,15 @@ impl Service {
         // check-config never reaches here.
         generated_cert::resolve_generated_cert(&mut cfg)?;
         let (policy, tls_config) = Self::prepare_config(&cfg)?;
+        // #15: one structured line so a configured-but-unapplied rule is
+        // visible at startup; the only warning case (PP on with an empty
+        // trusted list) already lives in `AccessPolicy::from_server_config`.
+        tracing::info!(
+            deny_src_cidrs = policy.deny_src_cidrs.len(),
+            proxy_protocol = policy.proxy_protocol,
+            proxy_protocol_trusted_cidrs = policy.trusted_proxy_cidrs.len(),
+            "access policy: denySrcCidrs applies to tcp/udp tunnels, the control port and the http/https gateways; PROXY protocol applies to the tcp/http/https gateways only (not the control port, not udp); the dashboard keeps its own auth"
+        );
         let access = Arc::new(RwLock::new(Arc::new(policy)));
         let http_gw = if cfg.http_gw_enabled() {
             Some(Arc::new(HttpGw::new(cfg.http_gw_port)))

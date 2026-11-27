@@ -11,7 +11,12 @@ proxyAddr = "0.0.0.0"
 udpPacketSize = 1500
 
 # Deny inbound connections from these source CIDRs (blocklist).
+# Applies to tcp/udp tunnels, the control port and the http/https gateways.
 # denySrcCidrs = ["10.0.0.0/8", "192.168.0.0/16"]
+
+# Accept PROXY protocol headers from trusted upstreams on the
+# tcp/http/https gateways only (not the control port, not udp).
+# proxyProtocol = false
 
 # Trust PROXY protocol headers only from these upstream CIDRs.
 # proxyProtocolTrustedCidrs = ["10.0.0.1/32"]
