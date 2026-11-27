@@ -147,6 +147,9 @@ fn limits_defaults_are_the_approved_values() {
     assert_eq!(l.max_waiting_visitors_per_tunnel, 32);
     assert_eq!(l.max_outstanding_data_conns, 8);
     assert_eq!(l.pool_idle_ttl_secs, 300);
+    assert_eq!(l.max_udp_visitors_per_tunnel, 1024);
+    assert_eq!(l.udp_packets_per_sec_per_source, 1000);
+    assert_eq!(l.udp_packets_per_sec_per_tunnel, 10_000);
 }
 
 #[test]
@@ -178,6 +181,26 @@ fn limits_zero_cap_fails_validation() {
     cfg.complete();
     let err = cfg.validate().unwrap_err();
     assert!(err.to_string().contains("limits.preLoginMaxConns must be > 0"), "{err}");
+}
+
+#[test]
+fn limits_udp_aliases_parse_and_zero_visitor_cap_fails_validation() {
+    for (key, want) in [
+        ("maxUdpVisitorsPerTunnel", 7usize),
+        ("max_udp_visitors_per_tunnel", 7usize),
+    ] {
+        let cfg: ServerConfig =
+            toml::from_str(&format!("[limits]\n{key} = 7")).unwrap();
+        assert_eq!(cfg.limits.max_udp_visitors_per_tunnel, want);
+    }
+    let cfg: ServerConfig =
+        toml::from_str("[limits]\nudpPacketsPerSecPerSource = 0").unwrap();
+    assert_eq!(cfg.limits.udp_packets_per_sec_per_source, 0);
+    let mut cfg2: ServerConfig =
+        toml::from_str("[limits]\nmaxUdpVisitorsPerTunnel = 0").unwrap();
+    cfg2.complete();
+    let err = cfg2.validate().unwrap_err();
+    assert!(err.to_string().contains("limits.maxUdpVisitorsPerTunnel must be > 0"), "{err}");
 }
 
 #[test]

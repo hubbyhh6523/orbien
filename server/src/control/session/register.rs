@@ -261,7 +261,16 @@ impl Control {
         let name = np.tunnel_name.clone();
         let control = Arc::clone(self);
         let packet_size = self.cfg.udp_packet_size.max(512);
-        let max_connections = np.max_connections;
+        // #14: the operator's cap wins; the client's `maxConnections`
+        // can only lower it, never raise it (0 = no client request).
+        let limits = orbien_core::udp::UdpForwardLimits {
+            max_sessions: effective_udp_sessions(
+                np.max_connections,
+                self.cfg.limits.max_udp_visitors_per_tunnel,
+            ),
+            per_source_pps: self.cfg.limits.udp_packets_per_sec_per_source,
+            per_tunnel_pps: self.cfg.limits.udp_packets_per_sec_per_tunnel,
+        };
 
         {
             // #11: same as TCP above — the old socket must be released
@@ -279,7 +288,7 @@ impl Control {
             control,
             limiter,
             packet_size,
-            max_connections,
+            limits,
             Arc::clone(&self.access),
         )
         .await?;
@@ -301,5 +310,29 @@ impl Control {
             self.metrics.close_tunnel(&cp.tunnel_name, ty);
         }
         Ok(())
+    }
+}
+
+/// Effective UDP visitor cap (#14): the operator's cap wins; the
+/// client's `maxConnections` can only lower it. A client request of 0
+/// means "no request" (unlimited in the old sense) and yields the
+/// operator cap.
+fn effective_udp_sessions(client_max: usize, operator_cap: usize) -> usize {
+    match client_max {
+        0 => operator_cap,
+        c => c.min(operator_cap),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_udp_sessions;
+
+    #[test]
+    fn effective_udp_sessions_client_can_only_lower() {
+        assert_eq!(effective_udp_sessions(0, 1024), 1024);
+        assert_eq!(effective_udp_sessions(100, 1024), 100);
+        assert_eq!(effective_udp_sessions(5000, 1024), 1024);
+        assert_eq!(effective_udp_sessions(1024, 1024), 1024);
     }
 }

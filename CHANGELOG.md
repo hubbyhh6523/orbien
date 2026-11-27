@@ -7,6 +7,7 @@
 ### Security
 - **denySrcCidrs 与 PROXY Protocol 现在真正生效**（#15）：两者之前只存在于配置与死代码中，从未对任何监听器生效。现在 `denySrcCidrs` 对 TCP/UDP 隧道、控制端口（TCP/KCP/QUIC/WebSocket）和 HTTP/HTTPS 网关的访客都生效，被拒连接在请求数据连接之前关闭；`proxyProtocol` 对 TCP/HTTP/HTTPS 网关生效，控制端口与 UDP 不解析 PP 头，不可信来源发来的 PP 头会被忽略。**行为变更**：已有 `denySrcCidrs` 配置的部署升级后会开始真正拦截；已开启 `proxyProtocol` 的部署，日志 / `X-Forwarded-For` / 客户端看到的访客 IP 将从上游地址变为 PP 头里的真实访客 IP。
 - 移除未接入模块树的死代码 `server/src/proxy/`（http/mod/vhost）；其逻辑已由 `server/src/access/mod.rs` 的 `prepare_ingress` 统一实现。
+- **UDP 隧道不再向任意地址发包，访客会话有上限**（#14）：服务端只把回复发给最近 30 秒内向隧道发过报文的访客地址，客户端指定的其他目标地址会被丢弃并计数；访客会话始终被跟踪，默认每条隧道最多 1024 个访客（`limits.maxUdpVisitorsPerTunnel`，客户端的 `maxConnections` 只能调低、不能调高）；新增每源 1000 包/秒、每隧道 10000 包/秒的速率限制（`limits.udpPacketsPerSecPerSource` / `limits.udpPacketsPerSecPerTunnel`，`0` 表示关闭）；超过 `udpPacketSize` 的报文会被丢弃并计数（之前是静默截断后转发）；单次 `send_to` 失败只丢弃该报文，不再中断整条隧道的回复；Windows 上收包时的 connection-reset 错误不再结束收包循环；客户端每个 UDP 隧道最多 1024 个访客套接字/任务（`udpMaxSessions`），本地服务支持 IPv6 地址。**行为变更**：依赖“向从未联系过隧道的地址发包”的用法将不再工作；被丢弃报文的字节不再计入流量统计；游戏等访客众多的服务如需更高上限请调高 `maxUdpVisitorsPerTunnel`。
 
 ## [0.2.0] - 2026-08-26
 

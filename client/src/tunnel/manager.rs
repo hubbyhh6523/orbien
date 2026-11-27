@@ -26,6 +26,8 @@ struct TunnelEntry {
 pub struct TunnelManager {
     by_name: HashMap<String, TunnelEntry>,
     udp_packet_size: usize,
+    /// Max visitor sockets/tasks per UDP tunnel forwarder (#14).
+    udp_max_sessions: usize,
 }
 
 impl TunnelManager {
@@ -93,6 +95,7 @@ impl TunnelManager {
         Ok(Self {
             by_name,
             udp_packet_size: cfg.udp_packet_size.max(512),
+            udp_max_sessions: cfg.udp_max_sessions.max(1),
         })
     }
 
@@ -225,6 +228,7 @@ impl TunnelManager {
             local_addr,
             self.udp_packet_size,
             entry.proxy_protocol.map(|s| s.to_string()),
+            self.udp_max_sessions,
             cancel_rx,
         )
         .await

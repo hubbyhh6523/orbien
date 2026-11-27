@@ -27,6 +27,15 @@ pub struct ClientConfig {
         alias = "udp_packet_size"
     )]
     pub udp_packet_size: usize,
+
+    /// Max visitor sockets/tasks per UDP tunnel forwarder (#14).
+    /// 0 in the config file means the default (see `complete()`).
+    #[serde(
+        default = "default_udp_max_sessions",
+        rename = "udpMaxSessions",
+        alias = "udp_max_sessions"
+    )]
+    pub udp_max_sessions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -197,6 +206,8 @@ pub struct TunnelConfig {
     /// Maximum simultaneous connections allowed for this proxy.
     /// 0 (default) means unlimited.
     /// TCP/HTTP/HTTPS count live streams; UDP counts recent visitor sessions.
+    /// For UDP the server's `maxUdpVisitorsPerTunnel` is the hard cap;
+    /// this value can only lower it (#14).
     #[serde(default, rename = "maxConnections", alias = "max_connections")]
     pub max_connections: usize,
 }
@@ -288,6 +299,10 @@ fn default_heartbeat_timeout() -> i64 {
 
 fn default_udp_packet_size() -> usize {
     1500
+}
+
+fn default_udp_max_sessions() -> usize {
+    1024
 }
 
 fn default_server() -> String {
@@ -404,6 +419,10 @@ impl ClientConfig {
 
         if self.udp_packet_size == 0 {
             self.udp_packet_size = default_udp_packet_size();
+        }
+
+        if self.udp_max_sessions == 0 {
+            self.udp_max_sessions = default_udp_max_sessions();
         }
 
         if self.transport.tls.server_name.trim().is_empty() {
@@ -648,6 +667,7 @@ mod tests {
             transport: TransportConfig::default(),
             tunnels: vec![],
             udp_packet_size: 1500,
+            udp_max_sessions: default_udp_max_sessions(),
         }
     }
 

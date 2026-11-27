@@ -131,6 +131,8 @@ pub fn load_merge_server_fields(
             transport: TransportConfig::default(),
             tunnels: Vec::new(),
             udp_packet_size: 1500,
+            // 0 = default; `complete()` below fills it in (#14).
+            udp_max_sessions: 0,
         }
     };
 
@@ -228,6 +230,8 @@ fn build_base(
         transport,
         tunnels,
         udp_packet_size: 1500,
+        // 0 = default; `complete()` below fills it in (#14).
+        udp_max_sessions: 0,
     };
     cfg.auth.auth_type = "token".into();
     cfg.auth.token = token.to_string();
