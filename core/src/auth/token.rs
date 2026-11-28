@@ -279,7 +279,7 @@ pub fn unix_now() -> i64 {
 }
 
 /// Constant-time byte slice comparison (prevents timing oracle).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

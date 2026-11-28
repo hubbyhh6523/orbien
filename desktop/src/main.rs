@@ -86,6 +86,8 @@ fn row_to_tunnel(row: &TunnelRow) -> anyhow::Result<orbien_core::config::TunnelC
         row.plugin_host_rewrite.as_str(),
         row.plugin_username.as_str(),
         row.plugin_password.as_str(),
+        row.plugin_allow_private_targets,
+        row.plugin_allowed_targets.as_str(),
     )
 }
 
@@ -114,6 +116,8 @@ fn tunnel_to_row(p: &orbien_core::config::TunnelConfig) -> TunnelRow {
         plugin_host_rewrite: parts.plugin_host_rewrite.into(),
         plugin_username: parts.plugin_username.into(),
         plugin_password: parts.plugin_password.into(),
+        plugin_allow_private_targets: parts.plugin_allow_private_targets,
+        plugin_allowed_targets: parts.plugin_allowed_targets.into(),
     }
 }
 
@@ -447,6 +451,10 @@ fn collect_tunnel_form(ui: &AppWindow) -> TunnelRow {
         } else {
             "".into()
         },
+        // #17: no visible UI yet; the save handler carries these over
+        // from the row being edited.
+        plugin_allow_private_targets: false,
+        plugin_allowed_targets: "".into(),
     }
 }
 
@@ -1053,7 +1061,7 @@ fn wire_tunnel_and_config(
             }
         }
 
-        let row = collect_tunnel_form(&ui);
+        let mut row = collect_tunnel_form(&ui);
         let model = ui.get_tunnels();
         let previous: Vec<TunnelRow> = (0..model.row_count())
             .filter_map(|i| model.row_data(i))
@@ -1071,6 +1079,10 @@ fn wire_tunnel_and_config(
                 return;
             }
             if i < rows.len() {
+                // #17: the form has no UI for the SOCKS5 destination
+                // policy; keep the values from the row being edited.
+                row.plugin_allow_private_targets = rows[i].plugin_allow_private_targets;
+                row.plugin_allowed_targets = rows[i].plugin_allowed_targets.clone();
                 rows[i] = row;
             }
         } else {

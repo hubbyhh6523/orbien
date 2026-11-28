@@ -5,12 +5,18 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use orbien_core::config::PluginConfig;
 use orbien_core::transport::DynStream;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PluginContext {
     pub name: String,
     pub cert_common_name: String,
+    /// Resolved IPs of the client's own server endpoint (#17): the SOCKS5
+    /// plugin always refuses targets matching these.
+    pub server_addrs: Vec<IpAddr>,
+    /// Tunnel `maxConnections` (#17): the SOCKS5 session cap when > 0.
+    pub max_connections: usize,
 }
 
 #[allow(dead_code)]

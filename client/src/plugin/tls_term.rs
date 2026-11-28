@@ -162,6 +162,8 @@ mod tests {
         PluginContext {
             name: "rewrite-test".to_owned(),
             cert_common_name: "localhost".to_owned(),
+            server_addrs: vec![],
+            max_connections: 0,
         }
     }
 

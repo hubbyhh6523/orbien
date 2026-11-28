@@ -235,6 +235,44 @@ pub struct PluginConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+
+    /// Allow SOCKS5 targets in loopback/link-local/private ranges (#17).
+    /// Default false: those targets are refused. This never allows the
+    /// client's own server address; use `allowedTargets` for that.
+    #[serde(default, rename = "allowPrivateTargets", alias = "allow_private_targets")]
+    pub allow_private_targets: bool,
+
+    /// Destination allow list (#17): CIDR ranges or single IPs that bypass
+    /// the default destination refusal. Checked against the resolved IP,
+    /// after DNS resolution, and wins over every refusal below.
+    #[serde(default, rename = "allowedTargets", alias = "allowed_targets")]
+    pub allowed_targets: Vec<String>,
+
+    /// Failed SOCKS5 logins from one source before it is locked out (#17).
+    /// 0 disables the lockout.
+    #[serde(
+        default = "default_socks5_auth_max_failures",
+        rename = "authMaxFailures",
+        alias = "auth_max_failures"
+    )]
+    pub auth_max_failures: u32,
+
+    /// How long a locked-out source stays refused, in seconds (#17).
+    #[serde(
+        default = "default_socks5_auth_lockout_secs",
+        rename = "authLockoutSecs",
+        alias = "auth_lockout_secs"
+    )]
+    pub auth_lockout_secs: u64,
+
+    /// Idle timeout for a relayed SOCKS5 connection, in seconds (#17).
+    /// 0 disables the idle timeout.
+    #[serde(
+        default = "default_socks5_idle_timeout_secs",
+        rename = "idleTimeoutSecs",
+        alias = "idle_timeout_secs"
+    )]
+    pub idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -303,6 +341,18 @@ fn default_udp_packet_size() -> usize {
 
 fn default_udp_max_sessions() -> usize {
     1024
+}
+
+fn default_socks5_auth_max_failures() -> u32 {
+    5
+}
+
+fn default_socks5_auth_lockout_secs() -> u64 {
+    600
+}
+
+fn default_socks5_idle_timeout_secs() -> u64 {
+    300
 }
 
 fn default_server() -> String {
@@ -585,6 +635,16 @@ impl ClientConfig {
                 "tunnel `{}` socks5 requires username and password",
                 name
             ));
+        }
+        // #17: short passwords warn at startup (see
+        // `ClientConfig::risk_warnings`); a later release will refuse them.
+        for entry in &plugin.allowed_targets {
+            crate::net::Cidr::parse(entry).map_err(|e| {
+                anyhow!(
+                    "tunnel `{}` socks5 allowedTargets entry {entry:?} is not a CIDR or IP: {e}",
+                    name
+                )
+            })?;
         }
         Ok(())
     }

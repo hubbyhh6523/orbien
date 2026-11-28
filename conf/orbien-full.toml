@@ -109,3 +109,11 @@ type = "socks5"
 username = "admin"
 # CHANGE ME: generate with `openssl rand -base64 24`.
 password = "CHANGE_ME_base64"
+# #17: destination policy — private/loopback/link-local targets are refused
+# by default; list CIDRs/IPs here to allow them, or set
+# allowPrivateTargets = true (the orbien server address stays refused).
+# allowedTargets = ["10.0.0.0/8"]
+# allowPrivateTargets = false
+# authMaxFailures = 5  # 0 disables the lockout
+# authLockoutSecs = 600
+# idleTimeoutSecs = 300  # 0 disables the idle timeout

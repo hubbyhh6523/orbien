@@ -8,7 +8,7 @@
 //! shutdown paths (a `Notify` or a closed flag), so there is no
 //! "listener closed" error to stop on — every accept error retries.
 
-use crate::ratelimit::LogThrottle;
+use orbien_core::ratelimit::LogThrottle;
 use anyhow::Error;
 use std::io;
 use std::time::Duration;

@@ -21,4 +21,9 @@ export struct TunnelRow {
     plugin-host-rewrite: string,
     plugin-username: string,
     plugin-password: string,
+    // #17: SOCKS5 destination policy; no visible UI yet, carried through
+    // the row so editing a tunnel in the desktop does not silently drop
+    // settings made in the config file.
+    plugin-allow-private-targets: bool,
+    plugin-allowed-targets: string,
 }
