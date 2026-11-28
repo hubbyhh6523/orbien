@@ -11,6 +11,7 @@ pub async fn run_udp_session(
     local_addr: SocketAddr,
     packet_size: usize,
     proxy_protocol_version: Option<String>,
+    max_sessions: usize,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(data);
@@ -28,6 +29,7 @@ pub async fn run_udp_session(
                 tx,
                 packet_size,
                 proxy_protocol_version,
+                max_sessions,
             )
             .await;
         })

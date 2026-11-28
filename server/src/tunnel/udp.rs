@@ -4,7 +4,10 @@ use crate::metrics::{MemMetrics, ServerMetrics};
 use anyhow::Result;
 use orbien_core::limit::{maybe_limit, BandwidthLimiter};
 use orbien_core::msg::{self, Message, UdpPacket};
-use orbien_core::udp::{forward_user_conn, CHANNEL_CAP, SERVER_DATA_READ_DEADLINE};
+use orbien_core::udp::{
+    forward_user_conn, UdpDropReason, UdpForwardHooks, UdpForwardLimits, CHANNEL_CAP,
+    SERVER_DATA_READ_DEADLINE,
+};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,8 +34,9 @@ pub struct UdpTunnel {
 }
 
 impl UdpTunnel {
-    // #11: 8 args — `access` is the live policy for the #15 source checks.
-    // Kept explicit (rather than re-reading it off `control`) so the
+    // #11: 8 args — `access` is the live policy for the #15 source checks,
+    // `limits` the #14 operator caps (effective visitor cap + rate limits).
+    // Kept explicit (rather than re-reading them off `control`) so the
     // tunnel's policy dependency is visible at the call site.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
@@ -42,7 +46,7 @@ impl UdpTunnel {
         control: Arc<Control>,
         limiter: Option<Arc<BandwidthLimiter>>,
         packet_size: usize,
-        max_connections: usize,
+        limits: UdpForwardLimits,
         access: Arc<RwLock<Arc<AccessPolicy>>>,
     ) -> Result<Self> {
         let addr = format!("{bind_addr}:{remote_port}");
@@ -65,6 +69,23 @@ impl UdpTunnel {
                 Err(_) => true,
             });
 
+        // #14: drops are reported in the `limit_rejections` metric
+        // under their fixed reason, and out-traffic is counted only
+        // when a reply is actually delivered to a visitor (the writer
+        // task calls `on_delivered` after a successful `send_to`).
+        let metrics_o = Arc::clone(&control.metrics);
+        let on_drop: Arc<dyn Fn(UdpDropReason) + Send + Sync> =
+            Arc::new(move |reason| metrics_o.inc_limit_reject(reason.metric_reason()));
+        let metrics_d = Arc::clone(&control.metrics);
+        let name_d = name.clone();
+        let on_delivered: Arc<dyn Fn(u64) + Send + Sync> =
+            Arc::new(move |n| metrics_d.add_traffic_out(&name_d, "udp", n));
+        let hooks = Arc::new(UdpForwardHooks {
+            is_denied,
+            on_drop,
+            on_delivered,
+        });
+
         let (send_tx, send_rx) = mpsc::channel::<UdpPacket>(CHANNEL_CAP);
         let (read_tx, read_rx) = mpsc::channel::<UdpPacket>(CHANNEL_CAP);
 
@@ -73,10 +94,11 @@ impl UdpTunnel {
         {
             let udp_f = Arc::clone(&udp);
             let notify_f = Arc::clone(&notify);
+            let name_f = name.clone();
             tasks.push(tokio::spawn(async move {
                 tokio::select! {
                     _ = notify_f.notified() => {}
-                    _ = forward_user_conn(udp_f, read_rx, send_tx, packet_size, max_connections, is_denied) => {}
+                    _ = forward_user_conn(udp_f, read_rx, send_tx, packet_size, limits, hooks, &name_f) => {}
                 }
             }));
         }
@@ -266,14 +288,18 @@ async fn data_reader<R: AsyncRead + Unpin + Send + 'static>(
                 tracing::trace!(tunnel = %tunnel_name, "udp data ping");
             }
             Ok(Ok(Message::UdpPacket(pkt))) => {
-                let nbytes = pkt.content.len() as u64;
                 tracing::trace!(
                     tunnel = %tunnel_name,
-                    len = nbytes,
+                    len = pkt.content.len(),
                     "udp packet from data"
                 );
-                metrics.add_traffic_out(&tunnel_name, "udp", nbytes);
-                let _ = read_tx.try_send(pkt);
+                // #14: out-traffic is counted only when the reply is
+                // actually delivered (via `on_delivered` in the writer
+                // task), not here — a packet dropped below was counted
+                // as traffic before. A full channel is a counted drop.
+                if read_tx.try_send(pkt).is_err() {
+                    metrics.inc_limit_reject("udp_channel_full");
+                }
             }
             Ok(Ok(other)) => {
                 tracing::debug!(

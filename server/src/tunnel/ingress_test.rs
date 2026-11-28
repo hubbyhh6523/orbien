@@ -12,10 +12,11 @@ use super::tcp::TcpTunnel;
 use crate::access::{AccessPolicy, Cidr};
 use crate::control::Control;
 use orbien_core::transport::boxed_stream;
-use orbien_core::udp::forward_user_conn;
+use orbien_core::udp::{forward_user_conn, UdpDropReason, UdpForwardHooks, UdpForwardLimits};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -266,22 +267,18 @@ async fn https_gateway_allowed_visitor_waits_for_client_hello() {
 async fn udp_forward_denied_datagram_dropped() {
     let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = sock.local_addr().unwrap();
-    let (_read_tx, read_rx) = mpsc::channel(16);
-    let (send_tx, mut send_rx) = mpsc::channel(16);
-    let is_denied: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
-        Arc::new(|ip| ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-    let task = tokio::spawn(forward_user_conn(
-        Arc::clone(&sock),
-        read_rx,
-        send_tx,
-        1500,
-        10,
-        is_denied,
-    ));
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(
+        Arc::new(|ip| ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+        Arc::clone(&counters),
+    );
+    let (_read_tx, mut send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.send_to(b"hello", addr).await.unwrap();
     let got = tokio::time::timeout(Duration::from_millis(300), send_rx.recv()).await;
     assert!(got.is_err(), "denied datagram must not be forwarded");
+    assert_eq!(counters.drops(UdpDropReason::Denied), 1);
     task.abort();
 }
 
@@ -289,21 +286,296 @@ async fn udp_forward_denied_datagram_dropped() {
 async fn udp_forward_allowed_datagram_reaches_send_tx() {
     let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = sock.local_addr().unwrap();
-    let (_read_tx, read_rx) = mpsc::channel(16);
-    let (send_tx, mut send_rx) = mpsc::channel(16);
-    let is_denied: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> = Arc::new(|_| false);
-    let task = tokio::spawn(forward_user_conn(
-        Arc::clone(&sock),
-        read_rx,
-        send_tx,
-        1500,
-        10,
-        is_denied,
-    ));
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (_read_tx, mut send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.send_to(b"hello", addr).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(2), send_rx.recv()).await;
-    let pkt = got.expect("allowed datagram must be forwarded").expect("channel open");
+    let pkt = got
+        .expect("allowed datagram must be forwarded")
+        .expect("channel open");
     assert_eq!(pkt.content.as_slice(), b"hello");
+    task.abort();
+}
+
+/// Counters behind the `UdpForwardHooks` of the #14 tests. The drop
+/// counts are meaningful even where this VM blocks UDP sendto (the
+/// hooks fire before any send), while the socket-level assertions
+/// need CI.
+#[derive(Default)]
+struct HookCounters {
+    drops: Mutex<HashMap<UdpDropReason, u64>>,
+    delivered_packets: AtomicU64,
+}
+
+impl HookCounters {
+    fn drops(&self, reason: UdpDropReason) -> u64 {
+        *self.drops.lock().unwrap().get(&reason).unwrap_or(&0)
+    }
+}
+
+fn test_hooks(
+    is_denied: Arc<dyn Fn(IpAddr) -> bool + Send + Sync>,
+    counters: Arc<HookCounters>,
+) -> Arc<UdpForwardHooks> {
+    let c1 = Arc::clone(&counters);
+    let c2 = Arc::clone(&counters);
+    Arc::new(UdpForwardHooks {
+        is_denied,
+        on_drop: Arc::new(move |reason| {
+            *c1.drops.lock().unwrap().entry(reason).or_insert(0) += 1;
+        }),
+        on_delivered: Arc::new(move |_| {
+            c2.delivered_packets.fetch_add(1, Ordering::SeqCst);
+        }),
+    })
+}
+
+async fn start_forward(
+    sock: Arc<UdpSocket>,
+    limits: UdpForwardLimits,
+    hooks: Arc<UdpForwardHooks>,
+) -> (
+    mpsc::Sender<orbien_core::msg::UdpPacket>,
+    mpsc::Receiver<orbien_core::msg::UdpPacket>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (read_tx, read_rx) = mpsc::channel(16);
+    let (send_tx, send_rx) = mpsc::channel(16);
+    let task = tokio::spawn(forward_user_conn(
+        sock, read_rx, send_tx, 1500, limits, hooks, "test",
+    ));
+    (read_tx, send_rx, task)
+}
+
+#[tokio::test]
+async fn udp_forward_reply_to_unknown_visitor_dropped() {
+    // #14: a client must not make the server send to an address that
+    // never sent a datagram to the tunnel.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (read_tx, _send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
+    let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let victim_addr = victim.local_addr().unwrap();
+    let pkt = orbien_core::msg::UdpPacket::new(b"spoofed".to_vec(), Some(victim_addr));
+    read_tx.send(pkt).await.unwrap();
+    // The victim must receive nothing (and the drop is counted even
+    // where the VM blocks UDP sendto).
+    let got =
+        tokio::time::timeout(Duration::from_millis(300), victim.recv_from(&mut [0u8; 64])).await;
+    assert!(got.is_err(), "reply to an unknown visitor must be dropped");
+    assert_eq!(counters.drops(UdpDropReason::NoVisitor), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn udp_forward_known_visitor_reply_delivered() {
+    // #14: the normal path — a visitor's datagram goes to the client,
+    // and the client's reply comes back to that visitor.
+    // CI-only: this VM blocks UDP sendto, so the reply never lands.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (read_tx, mut send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
+    let visitor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    visitor.send_to(b"hello", addr).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), send_rx.recv()).await;
+    let pkt = got
+        .expect("visitor datagram must be forwarded")
+        .expect("channel open");
+    assert_eq!(pkt.content.as_slice(), b"hello");
+    let reply = orbien_core::msg::UdpPacket::new(
+        b"world".to_vec(),
+        pkt.remote_addr.as_ref().and_then(|a| a.to_std()),
+    );
+    read_tx.send(reply).await.unwrap();
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), visitor.recv_from(&mut buf))
+        .await
+        .expect("reply must arrive")
+        .unwrap();
+    assert_eq!(&buf[..n], b"world");
+    assert_eq!(counters.delivered_packets.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn udp_forward_session_cap_enforced() {
+    // #14: with the default cap the visitor beyond the cap is dropped
+    // and counted. CI-only: the VM blocks UDP sendto.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (_read_tx, mut send_rx, task) = start_forward(
+        Arc::clone(&sock),
+        UdpForwardLimits {
+            max_sessions: 2,
+            per_source_pps: 0,
+            per_tunnel_pps: 0,
+        },
+        hooks,
+    )
+    .await;
+    let mut visitors = Vec::new();
+    for _ in 0..3 {
+        let v = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        v.send_to(b"hi", addr).await.unwrap();
+        visitors.push(v);
+    }
+    let mut forwarded = 0;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(300), send_rx.recv()).await {
+            Ok(Some(_)) => forwarded += 1,
+            _ => break,
+        }
+    }
+    assert_eq!(forwarded, 2, "only the first two visitors fit the cap");
+    assert_eq!(counters.drops(UdpDropReason::SessionCap), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn udp_forward_send_error_does_not_kill_writer() {
+    // #14: a failed `send_to` drops that datagram only; later replies
+    // of other visitors are still delivered. The failure is triggered
+    // with a reply larger than the max UDP payload (EMSGSIZE) to a
+    // visitor the table knows: a reply to an unknown address would be
+    // dropped as NoVisitor before any send is attempted, and a port-0
+    // address can never be a tracked visitor. CI-only: the VM blocks
+    // UDP sendto.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (read_tx, mut send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
+    let visitor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let visitor_addr = visitor.local_addr().unwrap();
+    visitor.send_to(b"hello", addr).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), send_rx.recv()).await;
+    got.expect("visitor datagram must be forwarded")
+        .expect("channel open");
+    // Reply 1: 70000 bytes exceeds the max UDP payload, so `send_to`
+    // fails.
+    read_tx
+        .send(orbien_core::msg::UdpPacket::new(
+            vec![0u8; 70_000],
+            Some(visitor_addr),
+        ))
+        .await
+        .unwrap();
+    // Reply 2: the real visitor must still get its reply.
+    read_tx
+        .send(orbien_core::msg::UdpPacket::new(
+            b"good".to_vec(),
+            Some(visitor_addr),
+        ))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), visitor.recv_from(&mut buf))
+        .await
+        .expect("second reply must arrive after a failed send")
+        .unwrap();
+    assert_eq!(&buf[..n], b"good");
+    assert_eq!(counters.drops(UdpDropReason::SendError), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn udp_forward_truncated_datagram_dropped_and_counted() {
+    // #14: a datagram larger than the receive buffer is dropped and
+    // counted, not forwarded truncated. CI-only: the VM blocks UDP.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (_read_tx, mut send_rx, task) =
+        start_forward(Arc::clone(&sock), UdpForwardLimits::default(), hooks).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(&vec![0u8; 2000], addr).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_millis(300), send_rx.recv()).await;
+    assert!(got.is_err(), "oversized datagram must not be forwarded");
+    assert_eq!(counters.drops(UdpDropReason::Truncated), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn udp_forward_rate_limited() {
+    // #14: per-source packet rate limits drop excess packets and count
+    // them. CI-only: the VM blocks UDP sendto.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (_read_tx, mut send_rx, task) = start_forward(
+        Arc::clone(&sock),
+        UdpForwardLimits {
+            max_sessions: 10,
+            per_source_pps: 2,
+            per_tunnel_pps: 0,
+        },
+        hooks,
+    )
+    .await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for _ in 0..3 {
+        client.send_to(b"hi", addr).await.unwrap();
+    }
+    let mut forwarded = 0;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(300), send_rx.recv()).await {
+            Ok(Some(_)) => forwarded += 1,
+            _ => break,
+        }
+    }
+    assert_eq!(forwarded, 2, "third packet exceeds the 2 pps limit");
+    assert_eq!(counters.drops(UdpDropReason::RateLimited), 1);
+    task.abort();
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn udp_forward_recv_reset_continues() {
+    // #14: on Windows a UDP socket reports connection-reset on receive
+    // after a send to an unreachable port; the receive loop must keep
+    // serving visitors afterwards.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let counters = Arc::new(HookCounters::default());
+    let hooks = test_hooks(Arc::new(|_| false), Arc::clone(&counters));
+    let (_read_tx, mut send_rx, task) = start_forward(
+        Arc::clone(&sock),
+        UdpForwardLimits {
+            max_sessions: 10,
+            per_source_pps: 0,
+            per_tunnel_pps: 0,
+        },
+        hooks,
+    )
+    .await;
+    // Trigger ICMP port-unreachable from the tunnel socket.
+    let closed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let _ = sock.send_to(b"x", closed).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut ok = false;
+    for _ in 0..20 {
+        client.send_to(b"hello", addr).await.unwrap();
+        if tokio::time::timeout(Duration::from_millis(100), send_rx.recv())
+            .await
+            .is_ok()
+        {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "receive loop must survive a connection-reset error");
     task.abort();
 }

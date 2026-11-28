@@ -31,9 +31,11 @@ pub struct ServerSnapshot {
     pub client_counts: usize,
     pub total_client_counts: usize,
     pub tunnel_type_counts: HashMap<String, usize>,
-    /// Rejections by the #13 limits, keyed by the fixed reason set:
+    /// Rejections by the #13/#14/#15 limits, keyed by the fixed reason set:
     /// pre_login_timeout, first_message_too_large, pre_login_cap,
-    /// waiting_visitors, idle_timeout, unexpected_message.
+    /// waiting_visitors, idle_timeout, unexpected_message, deny_src_cidrs,
+    /// udp_no_visitor, udp_session_cap, udp_rate_limited, udp_channel_full,
+    /// udp_send_error, udp_truncated, udp_recv_reset.
     pub limit_rejections: HashMap<String, u64>,
 }
 
@@ -139,7 +141,7 @@ impl MemMetrics {
         })
     }
 
-    /// Count one rejection by a #13 limit. `reason` must be one of the
+    /// Count one rejection by a #13/#14/#15 limit. `reason` must be one of the
     /// fixed reasons listed on [`ServerSnapshot::limit_rejections`].
     pub fn inc_limit_reject(&self, reason: &'static str) {
         let mut g = self.state.lock().expect("metrics lock");

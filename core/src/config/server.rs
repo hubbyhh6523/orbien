@@ -166,6 +166,33 @@ pub struct LimitsConfig {
         alias = "pool_idle_ttl_secs"
     )]
     pub pool_idle_ttl_secs: u64,
+
+    /// Max tracked visitors per UDP tunnel (#14). The operator's cap;
+    /// a client's `maxConnections` can only lower it, never raise it.
+    #[serde(
+        default = "default_max_udp_visitors",
+        rename = "maxUdpVisitorsPerTunnel",
+        alias = "max_udp_visitors_per_tunnel"
+    )]
+    pub max_udp_visitors_per_tunnel: usize,
+
+    /// Max UDP packets/sec from one source IP per tunnel (#14).
+    /// 0 = no per-source rate limit.
+    #[serde(
+        default = "default_udp_pps_per_source",
+        rename = "udpPacketsPerSecPerSource",
+        alias = "udp_packets_per_sec_per_source"
+    )]
+    pub udp_packets_per_sec_per_source: u64,
+
+    /// Max UDP packets/sec for one tunnel in total (#14).
+    /// 0 = no per-tunnel rate limit.
+    #[serde(
+        default = "default_udp_pps_per_tunnel",
+        rename = "udpPacketsPerSecPerTunnel",
+        alias = "udp_packets_per_sec_per_tunnel"
+    )]
+    pub udp_packets_per_sec_per_tunnel: u64,
 }
 
 impl Default for LimitsConfig {
@@ -179,6 +206,9 @@ impl Default for LimitsConfig {
             max_waiting_visitors_per_tunnel: default_max_waiting_visitors(),
             max_outstanding_data_conns: default_max_outstanding_data_conns(),
             pool_idle_ttl_secs: default_pool_idle_ttl(),
+            max_udp_visitors_per_tunnel: default_max_udp_visitors(),
+            udp_packets_per_sec_per_source: default_udp_pps_per_source(),
+            udp_packets_per_sec_per_tunnel: default_udp_pps_per_tunnel(),
         }
     }
 }
@@ -485,6 +515,15 @@ fn default_max_outstanding_data_conns() -> usize {
 fn default_pool_idle_ttl() -> u64 {
     300
 }
+fn default_max_udp_visitors() -> usize {
+    1024
+}
+fn default_udp_pps_per_source() -> u64 {
+    1000
+}
+fn default_udp_pps_per_tunnel() -> u64 {
+    10_000
+}
 fn default_udp_packet_size() -> usize {
     1500
 }
@@ -736,6 +775,9 @@ impl ServerConfig {
         }
         if limits.pool_idle_ttl_secs == 0 {
             anyhow::bail!("limits.poolIdleTtlSecs must be > 0");
+        }
+        if limits.max_udp_visitors_per_tunnel == 0 {
+            anyhow::bail!("limits.maxUdpVisitorsPerTunnel must be > 0");
         }
         let quic = &self.transport.quic;
         if quic.stream_recv_window == 0 {

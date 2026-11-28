@@ -1,6 +1,8 @@
 server = "127.0.0.1:9527"
 user = "lxien"
 udpPacketSize = 1500
+# Max visitor sockets/tasks per UDP tunnel forwarder (#14).
+udpMaxSessions = 1024
 
 [auth]
 type = "token"

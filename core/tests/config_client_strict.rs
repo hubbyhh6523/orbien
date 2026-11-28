@@ -114,12 +114,14 @@ fn client_keys_accept_both_styles_without_changing_values() {
         ("hostHeaderRewrite", "host_header_rewrite"),
         ("routeByHTTPUser", "route_by_http_user"),
         ("maxConnections", "max_connections"),
+        ("udpMaxSessions", "udp_max_sessions"),
         ("bandwidthLimitSide", "bandwidth_limit_side"),
         ("proxyProtocolVersion", "proxy_protocol_version"),
         ("requestHeaders", "request_headers"),
     ];
     let camel = r#"
 udpPacketSize = 1400
+udpMaxSessions = 48
 [auth]
 type = 'token'
 token = 'test'
@@ -168,6 +170,7 @@ X-App = 'trusted'
         cfg.complete();
         cfg.validate().unwrap();
         assert_eq!(cfg.udp_packet_size, 1400);
+        assert_eq!(cfg.udp_max_sessions, 48);
         assert_eq!(cfg.auth.token, "test");
         let transport = &cfg.transport;
         assert_eq!(transport.pool_count, 2);

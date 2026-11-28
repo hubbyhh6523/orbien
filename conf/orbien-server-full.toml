@@ -64,6 +64,12 @@ maxIncomingStreams = 1000
 #maxWaitingVisitorsPerTunnel = 32
 #maxOutstandingDataConns = 8
 #poolIdleTtlSecs = 300
+# UDP visitor caps and packet rate limits (#14). maxUdpVisitorsPerTunnel
+# is the operator cap per tunnel; a client's maxConnections can only
+# lower it. The packet rates are 0 = disabled.
+#maxUdpVisitorsPerTunnel = 1024
+#udpPacketsPerSecPerSource = 1000
+#udpPacketsPerSecPerTunnel = 10000
 
 [transport.tls]
 force = true
