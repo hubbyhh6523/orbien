@@ -92,3 +92,12 @@ staticDir = ""
 # X-Forwarded-Proto trusted (rate-limit keys, Secure cookie flag).
 # Empty (default) = direct mode, forwarding headers are never trusted.
 #trustedProxies = ["10.0.0.5", "fd00::/64"]
+# Optional: API keys for programmatic dashboard access (#3, slice 2).
+# Each key: unique name, key of at least 32 characters (generate with
+# `openssl rand -hex 32`), scope "read" (default, GET only) or "read-write".
+# Sent as `Authorization: Bearer <key>`; the server stores only SHA-256
+# hashes. Keys take effect on config reload.
+# [[dashboard.apiKeys]]
+#name = "monitoring"
+#key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#scope = "read"

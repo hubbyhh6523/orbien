@@ -90,11 +90,13 @@ Monitor 页会展示每个 token 的活跃控制连接数，以及 `allowed_tunn
 - Dashboard 绑在非 loopback 地址、且没有 `https://` origin 时，启动会
   打出警告：Basic Auth 头与登录密码在明文 HTTP 上是裸奔的，请在前面放
   一个 TLS 反向代理。占位密码（如 `CHANGE_ME`）启动时直接拒绝。
-- `GET /metrics` 与 `/api/` 走同一套鉴权（会话 Cookie 或 Basic Auth），
-  不再公开；抓取时必须提供凭据。
-- 登录与 Basic Auth 失败共享同一个限流器：同一来源 60 秒内失败 8 次
-  后会被限流（429），窗口过去之前即使凭据正确也会被拒绝；IPv6 按 /64
-  前缀共享桶。
+- `GET /metrics` 与 `/api/` 走同一套鉴权（会话 Cookie、Basic Auth 或
+  API key），不再公开；抓取时必须提供凭据。
+- 登录、Basic Auth 与未知 API key 的失败共享同一个限流器：同一来源
+  60 秒内失败 8 次后会被限流（429），窗口过去之前即使凭据正确也会被
+  拒绝；IPv6 按 /64 前缀共享桶。
+- API key 写操作还有每 key 限流：同一 key 60 秒内最多 60 次写请求，
+  超过返回 429。
 - 浏览器跨站请求会被拦截：`POST` / `PUT` / `DELETE` 带有与 `Host`
   不符的 `Origin`、或 `Sec-Fetch-Site: cross-site` 时返回 403；不带
   这些头的调用（如 curl）不受影响。
@@ -104,6 +106,50 @@ Monitor 页会展示每个 token 的活跃控制连接数，以及 `allowed_tunn
 - WebAuthn 待处理态 120 秒过期、最多 64 个，`login/begin` 按地址限流；
   注册 passkey 只允许给当前登录用户（会话）或配置的 dashboard 用户
   （Basic Auth）注册。
+
+## API Keys
+
+给程序化调用准备的鉴权方式（#3，切片 2）：在配置文件里配
+`[[dashboard.apiKeys]]`，调用时带 `Authorization: Bearer <key>`：
+
+```toml
+[dashboard]
+port = 8020
+user = "admin"
+password = "CHANGE_ME"
+
+# 每个 key：name 唯一，key 至少 32 个字符，scope 是 read（默认，只读）
+# 或 read-write（可写）。
+[[dashboard.apiKeys]]
+name = "monitoring"
+key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+scope = "read"
+```
+
+生成 key：
+
+```shell
+openssl rand -hex 32
+```
+
+```shell
+curl -H "Authorization: Bearer <key>" http://127.0.0.1:8020/api/v1/system/info
+curl -H "Authorization: Bearer <key>" http://127.0.0.1:8020/metrics
+```
+
+- `read` key 只能调用 `GET`（和 `HEAD`）接口，包括 `/metrics`；调
+  `POST` / `PUT` / `DELETE`（reload、kick、删除）返回 403。
+  `read-write` key 可以调用全部接口。
+- 服务端运行时只存 key 的 SHA-256 哈希，不存明文；日志与响应里只出现
+  哈希的前 16 位（key id），不会出现 key 本身。配置文件里是明文，
+  请把配置文件设为 0600、不要提交到仓库。
+- 改 key 只需改配置文件后调 `POST /api/v1/config/reload`（需要
+  `read-write` key 或会话登录）：新增的 key 立即生效，被删的 key 立
+  即失效；配置里有不合格的 key（太短、重名）时整个 reload 失败，
+  旧 key 继续有效。
+- 未知的 key 返回 401，并计入按地址的鉴权失败限流；每个 key 的写操作
+  另有 60 次/分钟的限流，超过返回 429。
+- API key 只走配置文件管理：没有新建/吊销接口，也没有对应的 UI 页面。
 
 ## Prometheus 监控
 

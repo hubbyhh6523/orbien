@@ -10,6 +10,12 @@
 //! ## Backward compatibility
 //! If no session cookie is present the middleware falls back to HTTP Basic Auth
 //! so existing integrations keep working without changes.
+//!
+//! ## API keys (#3, slice 2)
+//! `Authorization: Bearer <key>` authenticates against the hash-only store
+//! owned by `Service` (config `[[dashboard.apiKeys]]`). A `read` key may
+//! only call `GET`/`HEAD`; a `read-write` key may also write. Bearer is
+//! checked after the session cookie and before Basic Auth.
 
 use crate::dashboard::DashState;
 use axum::{
@@ -20,6 +26,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use orbien_core::auth::constant_time_eq;
+use orbien_core::config::ApiKeyScope;
 use orbien_core::net::Cidr;
 use rand::RngExt;
 use std::{
@@ -46,12 +54,40 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 const COOKIE_NAME: &str = "orbien_session";
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const LOGIN_MAX_ATTEMPTS: u32 = 8;
+/// #3, slice 2: per-key write rate limit — 60 writes per minute per API
+/// key id. Generous for automation, still bounds a stolen key. Only
+/// writes that pass the scope check count.
+const API_KEY_WRITE_WINDOW: Duration = Duration::from_secs(60);
+const API_KEY_WRITE_MAX: u32 = 60;
 /// #3: pending WebAuthn states expire with the 120 s state cookie, and are
 /// capped so repeated `begin` calls cannot grow memory until restart.
 const WA_STATE_TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING_WA_STATES: usize = 64;
 
 use webauthn_rs::prelude::Passkey;
+
+/// Who authenticated this request, carried in the request extensions so
+/// handlers — and slice 3's audit log — can attribute an action without
+/// re-parsing credentials. `scope` is `Some` only for API keys; session
+/// and Basic Auth callers are unrestricted.
+///
+/// Not read yet: no handler consumes it in slice 2. Slice 3 (audit log)
+/// reads it; the allow stays until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct AuthInfo {
+    pub kind: AuthKind,
+    /// Username for session/Basic Auth, short key id for API keys.
+    pub id: String,
+    pub scope: Option<ApiKeyScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Session,
+    Basic,
+    ApiKey,
+}
 
 // ── public AuthState shared via DashState ────────────────────────────────────
 
@@ -63,6 +99,8 @@ pub struct AuthState {
     reg_states: DashMap<String, (PasskeyRegistration, Instant)>,
     auth_states: DashMap<String, (PasskeyAuthentication, Instant)>,
     login_attempts: DashMap<String, (u32, Instant)>,
+    /// #3, slice 2: write counts per API key id (short hash prefix).
+    api_key_writes: DashMap<String, (u32, Instant)>,
     pub webauthn: Option<Webauthn>,
     /// M3: when set, passkeys are persisted to this JSON file (0600) on every
     /// mutation and reloaded on startup, so registrations survive restarts.
@@ -77,6 +115,7 @@ impl AuthState {
             reg_states: DashMap::new(),
             auth_states: DashMap::new(),
             login_attempts: DashMap::new(),
+            api_key_writes: DashMap::new(),
             webauthn: None,
             passkey_store: None,
         }
@@ -331,6 +370,34 @@ impl AuthState {
     pub fn clear_login_failures(&self, key: &str) {
         self.login_attempts.remove(key);
     }
+
+    // ── per-key write limiter (#3, slice 2) ──────────────────────────────────
+
+    pub fn api_key_write_allowed(&self, key_id: &str) -> bool {
+        match self.api_key_writes.get(key_id) {
+            Some(entry) => {
+                let (count, started) = *entry;
+                started.elapsed() > API_KEY_WRITE_WINDOW || count < API_KEY_WRITE_MAX
+            }
+            None => true,
+        }
+    }
+
+    pub fn record_api_key_write(&self, key_id: &str) {
+        self.api_key_writes
+            .entry(key_id.to_string())
+            .and_modify(|(count, started)| {
+                if started.elapsed() > API_KEY_WRITE_WINDOW {
+                    *count = 1;
+                    *started = Instant::now();
+                } else {
+                    *count = count.saturating_add(1);
+                }
+            })
+            .or_insert((1, Instant::now()));
+        self.api_key_writes
+            .retain(|_, (_, started)| started.elapsed() <= API_KEY_WRITE_WINDOW * 2);
+    }
 }
 
 /// Write `bytes` to `path`, creating it with mode 0600 on unix so no other
@@ -377,7 +444,7 @@ fn random_token() -> String {
 #[allow(clippy::result_large_err)]
 pub async fn auth_middleware(
     State(state): State<Arc<DashState>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
     let path = req.uri().path();
@@ -425,8 +492,80 @@ pub async fn auth_middleware(
 
     if let Some(auth) = &state.auth {
         if let Some(token) = extract_cookie(req.headers(), COOKIE_NAME) {
-            if auth.validate_session(&token).is_some() {
+            if let Some(user) = auth.validate_session(&token) {
+                req.extensions_mut().insert(AuthInfo {
+                    kind: AuthKind::Session,
+                    id: user,
+                    scope: None,
+                });
                 return Ok(next.run(req).await);
+            }
+        }
+    }
+
+    // #3, slice 2: `Authorization: Bearer <key>` — checked after the
+    // session cookie and before Basic Auth. A presented Bearer is
+    // authoritative when present: an unknown key is a 401 (and counts
+    // against the per-address limiter, like a Basic Auth failure), it
+    // does not fall through to Basic Auth.
+    if let Some(presented) = extract_bearer(req.headers()) {
+        if let Some(auth) = &state.auth {
+            if !auth.login_allowed(&key) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many authentication attempts",
+                )
+                    .into_response());
+            }
+        }
+        let store = state.svc.api_key_store().await;
+        match store.lookup(&presented) {
+            Some(entry) => {
+                if let Some(auth) = &state.auth {
+                    auth.clear_login_failures(&key);
+                }
+                let is_write = !matches!(
+                    *req.method(),
+                    axum::http::Method::GET | axum::http::Method::HEAD
+                );
+                if is_write && !entry.scope.allows_write() {
+                    tracing::debug!(
+                        key_id = %entry.id,
+                        method = %req.method(),
+                        path = %path,
+                        "read-scoped API key denied write"
+                    );
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "read-scoped API key cannot perform writes",
+                    )
+                        .into_response());
+                }
+                if is_write {
+                    if let Some(auth) = &state.auth {
+                        if !auth.api_key_write_allowed(&entry.id) {
+                            return Err((
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "too many write requests for this API key",
+                            )
+                                .into_response());
+                        }
+                        auth.record_api_key_write(&entry.id);
+                    }
+                }
+                let info = AuthInfo {
+                    kind: AuthKind::ApiKey,
+                    id: entry.id.clone(),
+                    scope: Some(entry.scope),
+                };
+                req.extensions_mut().insert(info);
+                return Ok(next.run(req).await);
+            }
+            None => {
+                if let Some(auth) = &state.auth {
+                    auth.record_login_failure(&key);
+                }
+                return Err(unauthorized_response());
             }
         }
     }
@@ -448,6 +587,12 @@ pub async fn auth_middleware(
             if let Some(auth) = &state.auth {
                 auth.clear_login_failures(&key);
             }
+            let user = state.cfg.user.clone();
+            req.extensions_mut().insert(AuthInfo {
+                kind: AuthKind::Basic,
+                id: user,
+                scope: None,
+            });
             return Ok(next.run(req).await);
         }
         if let Some(auth) = &state.auth {
@@ -455,12 +600,35 @@ pub async fn auth_middleware(
         }
     }
 
+    Err(unauthorized_response())
+}
+
+/// Shared 401 with the `Basic` challenge (also used for unknown Bearer
+/// keys — the challenge names the fallback scheme, not the one tried).
+fn unauthorized_response() -> Response {
     let mut res = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     res.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         HeaderValue::from_static("Basic realm=\"Restricted\""),
     );
-    Err(res)
+    res
+}
+
+/// #3, slice 2: `Authorization: Bearer <token>` (scheme case-insensitive,
+/// like the Basic parser below). Returns the raw token, trimmed.
+fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    let h = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+    let token = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 /// #3: `true` when the request is cross-site — `Sec-Fetch-Site: cross-site`,
@@ -584,17 +752,6 @@ pub fn credentials_match(expected_user: &str, expected_pass: &str, user: &str, p
     }
     constant_time_eq(user.as_bytes(), expected_user.as_bytes())
         && constant_time_eq(pass.as_bytes(), expected_pass.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max = a.len().max(b.len());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..max {
-        let x = *a.get(i).unwrap_or(&0);
-        let y = *b.get(i).unwrap_or(&0);
-        diff |= (x ^ y) as usize;
-    }
-    diff == 0
 }
 
 fn basic_auth_ok(state: &DashState, headers: &axum::http::HeaderMap) -> bool {
@@ -834,5 +991,39 @@ mod tests {
         assert!(!credentials_match("admin", "", "admin", ""));
         assert!(credentials_match("admin", "secret", "admin", "secret"));
         assert!(!credentials_match("admin", "secret", "admin", "wrong"));
+    }
+
+    // #3, slice 2: Bearer extraction
+    #[test]
+    fn extract_bearer_cases() {
+        let mut h = HeaderMap::new();
+        assert_eq!(extract_bearer(&h), None);
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer abc123".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer(&h).as_deref(), Some("abc123"));
+        h.insert(
+            header::AUTHORIZATION,
+            "bearer   spaced-key  ".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer(&h).as_deref(), Some("spaced-key"));
+        h.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert_eq!(extract_bearer(&h), None);
+        h.insert(header::AUTHORIZATION, "Basic YWRtaW46eA==".parse().unwrap());
+        assert_eq!(extract_bearer(&h), None);
+    }
+
+    // #3, slice 2: per-key write limiter — 60 writes per 60 s window.
+    #[test]
+    fn api_key_write_limiter_allows_then_blocks() {
+        let auth = AuthState::session_only();
+        for _ in 0..API_KEY_WRITE_MAX {
+            assert!(auth.api_key_write_allowed("deadbeefdeadbeef"));
+            auth.record_api_key_write("deadbeefdeadbeef");
+        }
+        assert!(!auth.api_key_write_allowed("deadbeefdeadbeef"));
+        // A different key id has its own bucket.
+        assert!(auth.api_key_write_allowed("0123456789abcdef"));
     }
 }
