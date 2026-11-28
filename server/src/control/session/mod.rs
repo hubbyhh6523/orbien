@@ -4,7 +4,7 @@ pub(crate) mod validate;
 
 use crate::access::AccessPolicy;
 use crate::metrics::{MemMetrics, ServerMetrics};
-use crate::ratelimit::LogThrottle;
+use orbien_core::ratelimit::LogThrottle;
 use crate::tunnel::{HttpGw, HttpsGw, TunnelManager};
 use anyhow::{anyhow, Result};
 use orbien_core::config::ServerConfig;

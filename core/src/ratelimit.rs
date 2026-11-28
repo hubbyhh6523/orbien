@@ -1,7 +1,9 @@
 //! A tiny "log at most once per interval" throttle, shared by the
-//! accept-error logs, the control read loop and the P2P handler. One
-//! instance per log site: the first call in an interval passes, the
-//! rest are dropped until the interval has elapsed.
+//! accept-error logs, the control read loop, the P2P handler and (since
+//! #17) the client-side SOCKS5 auth-failure logs. Moved from the server
+//! so the client can reuse it. One instance per log site: the first call
+//! in an interval passes, the rest are dropped until the interval has
+//! elapsed.
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

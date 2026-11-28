@@ -335,6 +335,8 @@ pub fn tunnel_from_parts(
     plugin_host_rewrite: &str,
     plugin_username: &str,
     plugin_password: &str,
+    plugin_allow_private_targets: bool,
+    plugin_allowed_targets: &str,
 ) -> Result<TunnelConfig> {
     let ty = tunnel_type.trim().to_ascii_lowercase();
     let plugin = if ty == "socks5" {
@@ -342,6 +344,10 @@ pub fn tunnel_from_parts(
             plugin_type: "socks5".into(),
             username: plugin_username.trim().into(),
             password: plugin_password.trim().into(),
+            // #17: carried through the desktop round-trip (no visible UI
+            // yet) so saving in the desktop does not drop these settings.
+            allow_private_targets: plugin_allow_private_targets,
+            allowed_targets: split_csv(plugin_allowed_targets),
             ..Default::default()
         })
     } else if ty == "https" && plugin_tls_term {
@@ -354,6 +360,7 @@ pub fn tunnel_from_parts(
             request_headers: Default::default(),
             username: String::new(),
             password: String::new(),
+            ..Default::default()
         })
     } else {
         None
@@ -449,6 +456,12 @@ pub fn tunnel_to_parts(p: &TunnelConfig) -> TunnelParts {
             .unwrap_or_default(),
         plugin_username: socks5.map(|pl| pl.username.clone()).unwrap_or_default(),
         plugin_password: socks5.map(|pl| pl.password.clone()).unwrap_or_default(),
+        plugin_allow_private_targets: socks5
+            .map(|pl| pl.allow_private_targets)
+            .unwrap_or_default(),
+        plugin_allowed_targets: socks5
+            .map(|pl| pl.allowed_targets.join(", "))
+            .unwrap_or_default(),
     }
 }
 
@@ -475,6 +488,8 @@ pub struct TunnelParts {
     pub plugin_host_rewrite: String,
     pub plugin_username: String,
     pub plugin_password: String,
+    pub plugin_allow_private_targets: bool,
+    pub plugin_allowed_targets: String,
 }
 
 pub fn protocol_index(protocol: &str) -> i32 {

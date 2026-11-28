@@ -131,6 +131,18 @@ impl ClientConfig {
             secret_warning(&mut out, &format!("tunnels[{index}].basicAuthPassword"), &tunnel.basic_auth_password);
             if let Some(plugin) = &tunnel.plugin {
                 secret_warning(&mut out, &format!("tunnels[{index}].plugin.password"), &plugin.password);
+                // #17: a SOCKS5 password shorter than 16 characters warns
+                // for one release; a later release will refuse it. SOCKS5
+                // user/pass auth is cleartext on the visitor path, so a
+                // short password is trivially guessable once observed.
+                if plugin.plugin_type.trim().eq_ignore_ascii_case("socks5") {
+                    let pass = plugin.password.trim();
+                    if !pass.is_empty() && pass.chars().count() < 16 {
+                        out.push(format!(
+                            "[short-socks5-password] tunnels[{index}].plugin.password is shorter than 16 characters; it will be refused in a future release — generate one with `openssl rand -base64 24`"
+                        ));
+                    }
+                }
             }
         }
         out

@@ -3,7 +3,6 @@ mod access;
 mod control;
 mod dashboard;
 mod metrics;
-mod ratelimit;
 mod sanitize;
 mod service;
 mod tunnel;

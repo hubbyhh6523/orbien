@@ -33,6 +33,9 @@ pub struct TunnelManager {
 impl TunnelManager {
     pub fn from_config(cfg: &ClientConfig) -> Result<Self> {
         let mut by_name = HashMap::new();
+        // #17: resolve the client's own server endpoint once; the SOCKS5
+        // plugin refuses targets matching these addresses.
+        let server_addrs = resolve_server_addrs(&cfg.server);
         for p in &cfg.tunnels {
             let limiter = limit::limiter_if_side(
                 p.transport.bandwidth,
@@ -65,6 +68,8 @@ impl TunnelManager {
                     let ctx = PluginContext {
                         name: p.name.clone(),
                         cert_common_name: cn,
+                        server_addrs: server_addrs.clone(),
+                        max_connections: p.max_connections,
                     };
                     Some(plugin::create(ctx, pc)?)
                 }
@@ -251,4 +256,31 @@ fn pick_cert_common_name(domains: &[String], tunnel_name: &str) -> String {
         }
     }
     tunnel_name.trim().to_ascii_lowercase()
+}
+
+/// Resolve the client's own server endpoint once (#17). A lookup failure
+/// only warns: the plugin still runs, just without the server-address block.
+fn resolve_server_addrs(server: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let (host, port) = match orbien_core::config::parse_host_port(server, 9527) {
+        Ok(hp) => hp,
+        Err(e) => {
+            tracing::warn!(server = %server, error = %e,
+                "cannot parse server address; socks5 will not block the server address");
+            return Vec::new();
+        }
+    };
+    match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => {
+            let mut out: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+        Err(e) => {
+            tracing::warn!(server = %server, error = %e,
+                "cannot resolve server address; socks5 will not block the server address");
+            Vec::new()
+        }
+    }
 }
