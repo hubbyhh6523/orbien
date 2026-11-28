@@ -12,7 +12,6 @@
 //!   paths are empty, TLS is not enabled.
 
 use super::auth::AuthState;
-use super::model::ApiResponse;
 use super::routes;
 use super::DashState;
 use crate::service::Service;
@@ -50,6 +49,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth,
+            trusted_proxies: vec![],
         })
     }
 
@@ -151,8 +151,10 @@ mod tests {
         let req = Request::get("/api/v1/clients/no-such-id")
             .body(Body::empty())
             .unwrap();
-        let (status, _) = call(state, req).await;
+        let (status, json) = call(state, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // #3: the former bare 404 now carries the JSON envelope.
+        assert_eq!(json["code"], 404);
     }
 
     #[tokio::test]
@@ -164,8 +166,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let (status, json) = call(state, req).await;
-        // Handler always returns HTTP 200 but embeds the error code in the body.
-        assert_eq!(status, StatusCode::OK);
+        // #3: HTTP status follows the body's code (was 200 with code 404).
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(json["code"], 404);
     }
 
@@ -201,7 +203,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let (status, json) = call(state, req).await;
-        assert_eq!(status, StatusCode::OK); // handler returns 200 with code=404 in body
+        // #3: HTTP status follows the body's code (was 200 with code 404).
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(json["code"], 404);
     }
 
@@ -211,8 +214,10 @@ mod tests {
         let req = Request::get("/api/v1/proxies/no-such-proxy/traffic")
             .body(Body::empty())
             .unwrap();
-        let (status, _) = call(state, req).await;
+        let (status, json) = call(state, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // #3: the former bare 404 now carries the JSON envelope.
+        assert_eq!(json["code"], 404);
     }
 
     // ── /api/v1/tunnels ───────────────────────────────────────────────────────
@@ -258,8 +263,10 @@ mod tests {
         let req = Request::get("/api/v1/tunnels/no-such-tunnel/traffic")
             .body(Body::empty())
             .unwrap();
-        let (status, _) = call(state, req).await;
+        let (status, json) = call(state, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // #3: the former bare 404 now carries the JSON envelope.
+        assert_eq!(json["code"], 404);
     }
 
     // ── /api/v1/system/traffic ────────────────────────────────────────────────
@@ -326,6 +333,7 @@ mod tests {
                 ..Default::default()
             },
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let req = Request::get("/api/v1/system/tokens")
             .body(Body::empty())
@@ -394,6 +402,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let req = Request::get("/api/v1/auth/status")
             .body(Body::empty())
@@ -420,6 +429,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let req = Request::get("/api/v1/auth/status")
             .body(Body::empty())
@@ -448,6 +458,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let body = r#"{"username":"admin","password":"wrong"}"#;
         let req = Request::builder()
@@ -476,6 +487,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let body = r#"{"username":"admin","password":"secret"}"#;
         let req = Request::builder()
@@ -512,6 +524,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let req = Request::get("/api/v1/clients").body(Body::empty()).unwrap();
         let (status, _) = call(state, req).await;
@@ -535,6 +548,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let encoded = base64::engine::general_purpose::STANDARD.encode("admin:secret");
         let req = Request::get("/api/v1/clients")
@@ -563,6 +577,7 @@ mod tests {
             svc,
             cfg: web_cfg,
             auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
         });
         let encoded = base64::engine::general_purpose::STANDARD.encode("admin:wrong");
         let req = Request::get("/api/v1/clients")
@@ -571,6 +586,206 @@ mod tests {
             .unwrap();
         let (status, _) = call(state, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── #3: unknown /api/* paths ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_api_path_returns_json_404() {
+        let state = make_state();
+        for (method, uri) in [
+            ("GET", "/api/v1/no-such-endpoint"),
+            ("POST", "/api/v1/no-such-endpoint"),
+            ("DELETE", "/api/v1/clients/no-such-id/nope"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, json) = call(state.clone(), req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert_eq!(json["code"], 404, "{method} {uri}");
+            assert!(json["data"].is_object() || json["data"].is_null(), "{method} {uri}");
+        }
+    }
+
+    // ── #3: /metrics behind authentication ───────────────────────────────────
+
+    /// Dashboard state with password auth enabled (no disable_auth).
+    fn authed_state() -> Arc<DashState> {
+        let cfg = ServerConfig::default();
+        let svc = Arc::new(Service::new(cfg).expect("Service::new"));
+        let web_cfg = DashboardConfig {
+            addr: "127.0.0.1".into(),
+            port: 0,
+            user: "admin".into(),
+            password: "secret".into(),
+            disable_auth: false,
+            ..Default::default()
+        };
+        Arc::new(DashState {
+            svc,
+            cfg: web_cfg,
+            auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
+        })
+    }
+
+    fn basic_header(user: &str, pass: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        )
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_auth() {
+        let state = authed_state();
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let resp = call_raw(state.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let req = Request::get("/metrics")
+            .header("authorization", basic_header("admin", "secret"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = call_raw(state, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── #3: Basic Auth failure limiter ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn basic_auth_failures_are_rate_limited() {
+        let state = authed_state();
+        // 8 failures fill the 8/60s bucket…
+        for _ in 0..8 {
+            let req = Request::get("/api/v1/clients")
+                .header("authorization", basic_header("admin", "wrong"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = call(state.clone(), req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        // …the 9th attempt is rejected even with correct credentials.
+        let req = Request::get("/api/v1/clients")
+            .header("authorization", basic_header("admin", "secret"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state, req).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── #3: cross-site guard ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cross_site_post_is_rejected() {
+        let state = make_state();
+        // Origin host mismatches the request Host.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/clients/ghost/kick")
+            .header("host", "127.0.0.1:8020")
+            .header("origin", "https://evil.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state.clone(), req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Sec-Fetch-Site: cross-site, even with a matching Origin.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/clients/ghost/kick")
+            .header("host", "127.0.0.1:8020")
+            .header("origin", "http://127.0.0.1:8020")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state.clone(), req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn same_origin_and_headerless_posts_pass_cross_site_guard() {
+        let state = make_state();
+        // Same-origin POST reaches the handler (404: unknown client).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/clients/ghost/kick")
+            .header("host", "127.0.0.1:8020")
+            .header("origin", "http://127.0.0.1:8020")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = call(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], 404);
+
+        // No Origin / Sec-Fetch-Site at all (curl, API clients) also passes.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/clients/ghost/kick")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── #3: health uptime + online-only metrics ──────────────────────────────
+
+    #[tokio::test]
+    async fn system_health_reports_uptime() {
+        let state = make_state();
+        let req = Request::get("/api/v1/system/health")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = call(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["data"]["uptimeSecs"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_online_clients_only() {
+        use crate::service::OfflineClientRecord;
+        let state = make_state();
+        state
+            .svc
+            .record_offline(OfflineClientRecord {
+                session_id: "gone".into(),
+                user: "u".into(),
+                hostname: "h".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                client_ip: "10.0.0.1".into(),
+                version: "0.2.0".into(),
+                tunnel_count: 0,
+                disconnected_at: std::time::SystemTime::now(),
+            })
+            .await;
+        // Offline records show up in the client list (total 1) but must not
+        // count as online anywhere.
+        let req = Request::get("/api/v1/system/stats")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = call(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["clientsOnline"], 0);
+        assert_eq!(json["data"]["clientsTotal"], 1);
+
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let resp = call_raw(state, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).expect("utf-8 body");
+        assert!(body.contains("orbien_clients_online 0"), "online count wrong: {body}");
+        assert!(body.contains("orbien_clients_total 1"), "total count wrong: {body}");
     }
 
     // ── SPA fallback + legacy static redirects ────────────────────────────────

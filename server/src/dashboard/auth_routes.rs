@@ -68,7 +68,7 @@ fn get_sessions(state: &DashState) -> Result<&AuthState, Box<Response>> {
 }
 
 fn cookie_is_secure(state: &DashState, headers: &axum::http::HeaderMap) -> bool {
-    cookie_secure(headers, &state.cfg.webauthn_origin)
+    cookie_secure(headers, &state.cfg.webauthn_origin, &state.trusted_proxies)
 }
 
 // ── auth status (public) ───────────────────────────────────────────────────
@@ -102,7 +102,7 @@ pub async fn login(
     Json(body): Json<LoginReq>,
 ) -> Response {
     // 真实对端 IP 是限速键的不可伪造分量（M2 修复）
-    let key = client_key(&headers, Some(peer.ip()));
+    let key = client_key(&headers, Some(peer.ip()), &state.trusted_proxies);
     if let Some(auth) = &state.auth {
         if !auth.login_allowed(&key) {
             return err(StatusCode::TOO_MANY_REQUESTS, "too many login attempts");
@@ -191,6 +191,13 @@ pub async fn webauthn_register_begin(
                 "cannot register a passkey for another user",
             );
         }
+    } else if body.username != state.cfg.user {
+        // #3: with Basic Auth there is no session user, so the "another
+        // user" check above never fires — require the configured user here.
+        return err(
+            StatusCode::FORBIDDEN,
+            "cannot register a passkey for another user",
+        );
     }
 
     let user_id = uuid_for_name(&body.username);
@@ -214,7 +221,13 @@ pub async fn webauthn_register_begin(
         }
     };
 
-    auth.save_reg_state(&body.username, reg_state);
+    // #3: the pending-state store is capped; refuse rather than grow memory.
+    if !auth.save_reg_state(&body.username, reg_state) {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pending registrations",
+        );
+    }
     ok(challenge).into_response()
 }
 
@@ -254,6 +267,12 @@ pub async fn webauthn_register_finish(
                 "cannot register a passkey for another user",
             );
         }
+    } else if body.username != state.cfg.user {
+        // #3: see register_begin — Basic Auth has no session user.
+        return err(
+            StatusCode::FORBIDDEN,
+            "cannot register a passkey for another user",
+        );
     }
 
     let webauthn = match auth.webauthn.as_ref() {
@@ -274,11 +293,27 @@ pub async fn webauthn_register_finish(
 
 // ── WebAuthn login begin ────────────────────────────────────────────────────────
 
-pub async fn webauthn_login_begin(State(state): State<Arc<DashState>>) -> Response {
+pub async fn webauthn_login_begin(
+    State(state): State<Arc<DashState>>,
+    headers: axum::http::HeaderMap,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
     let auth = match get_auth(&state) {
         Ok(a) => a,
         Err(e) => return *e,
     };
+
+    // #3: rate-limit the begin call per client address — each call stores a
+    // pending state, so an unbounded caller grows memory until restart.
+    // Reuses the login limiter under a separate key namespace.
+    let key = format!(
+        "wa-begin:{}",
+        client_key(&headers, Some(peer.ip()), &state.trusted_proxies)
+    );
+    if !auth.login_allowed(&key) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "too many login attempts");
+    }
+    auth.record_login_failure(&key);
 
     let all_keys = auth.all_passkeys();
     if all_keys.is_empty() {
@@ -301,15 +336,13 @@ pub async fn webauthn_login_begin(State(state): State<Arc<DashState>>) -> Respon
     };
 
     let state_key = uuid::Uuid::new_v4().to_string();
-    auth.save_auth_state(&state_key, auth_state);
+    // #3: the pending-state store is capped; refuse rather than grow memory.
+    if !auth.save_auth_state(&state_key, auth_state) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "too many pending logins");
+    }
 
     let mut res = ok(challenge).into_response();
-    let secure = state
-        .cfg
-        .webauthn_origin
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("https://");
+    let secure = cookie_is_secure(&state, &headers);
     res.headers_mut()
         .insert(header::SET_COOKIE, wa_state_cookie(&state_key, secure));
     res
@@ -343,9 +376,11 @@ pub async fn webauthn_login_finish(
     };
     match webauthn.finish_passkey_authentication(&credential, &auth_state) {
         Ok(auth_result) => {
-            let username = auth
-                .apply_auth_result(&auth_result)
-                .unwrap_or_else(|| "admin".to_string());
+            // #3: no `admin` fallback — if the credential no longer maps to
+            // a user (deleted between begin and finish), fail the login.
+            let Some(username) = auth.apply_auth_result(&auth_result) else {
+                return err(StatusCode::UNAUTHORIZED, "authentication failed");
+            };
 
             let token = auth.create_session(&username);
             let secure = cookie_is_secure(&state, &req_headers);

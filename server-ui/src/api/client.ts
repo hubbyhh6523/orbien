@@ -15,7 +15,26 @@ import { ApiError } from './errors'
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const res = await fetch(path, { credentials: 'include', ...init })
     if (res.status === 401) throw new ApiError('unauthorized')
-    if (!res.ok) throw new ApiError('http', { status: res.status, statusText: res.statusText })
+    if (!res.ok) {
+        // #3: carry the server's message when the body has one — the server
+        // now answers errors with HTTP status == code and the JSON envelope.
+        // The body may be plain text instead (auth middleware), so a failed
+        // JSON parse falls back to the status text.
+        let msg: string | undefined
+        try {
+            const body = (await res.json()) as ApiResponse<unknown> | null
+            if (body && typeof body.msg === 'string' && body.msg.length > 0) {
+                msg = body.msg
+            }
+        } catch {
+            // not JSON — fall through to statusText
+        }
+        throw new ApiError('http', {
+            status: res.status,
+            statusText: res.statusText,
+            ...(msg ? { msg } : {}),
+        })
+    }
     const body = (await res.json()) as ApiResponse<T>
     if (body.code !== 200) throw new ApiError('api', { msg: body.msg })
     return body.data
@@ -143,16 +162,16 @@ export function fetchSystemTokens() {
 /**
  * POST /api/v1/config/reload
  *
- * Hot-reloads the server access policy from the config file.
- * Pass `configPath` to override the default path the server was started with.
- * Returns the list of top-level config keys that changed; empty list = no diff.
+ * Hot-reloads the server access policy from the config file recorded at
+ * startup. #3: the request body is ignored by the server — no path is
+ * sent anymore. Returns the list of top-level config keys that changed;
+ * empty list = no diff.
  */
-export function reloadConfig(configPath?: string) {
-    const body = configPath ? JSON.stringify({ configPath }) : '{}'
+export function reloadConfig() {
     return api<ConfigReloadResp>('/api/v1/config/reload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body,
+        body: '{}',
     })
 }
 

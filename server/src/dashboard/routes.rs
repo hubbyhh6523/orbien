@@ -67,8 +67,35 @@ pub fn router(state: Arc<DashState>) -> Router {
         .route("/api/v1/proxies", get(list_tunnels))
         .route("/api/v1/proxies/{name}", delete(kick_proxy))
         .route("/api/v1/proxies/{name}/traffic", get(tunnel_traffic))
+        // #3: unknown API paths answer JSON 404, never the SPA fallback.
+        // Registered before `/{*path}`; axum prefers the more specific
+        // `/api/` prefix, so real API routes still win.
+        .route("/api/{*path}", axum::routing::any(api_not_found))
         .route("/{*path}", get(static_file))
         .with_state(state)
+}
+
+/// #3: any unknown `/api/*` path — JSON envelope with HTTP 404, for every
+/// method. (Unauthenticated callers still get 401 first, from the middleware.)
+async fn api_not_found() -> (StatusCode, Json<ApiResponse<()>>) {
+    err_resp(404, "unknown api path", ())
+}
+
+/// #3: JSON error whose HTTP status follows its `code`. Handlers that used
+/// to answer HTTP 200 with an error `code` in the body now return this.
+fn err_resp<T: serde::Serialize>(
+    code: u16,
+    msg: impl Into<String>,
+    data: T,
+) -> (StatusCode, Json<ApiResponse<T>>) {
+    (
+        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(ApiResponse {
+            code: i32::from(code),
+            msg: msg.into(),
+            data,
+        }),
+    )
 }
 
 async fn redirect_legacy_static(Path(path): Path<String>) -> Redirect {
@@ -219,7 +246,7 @@ async fn system_health(State(state): State<Arc<DashState>>) -> Json<ApiResponse<
         .count();
     Json(ApiResponse::ok(HealthResp {
         status: "ok",
-        uptime_secs: 0,
+        uptime_secs: state.svc.uptime_secs(),
         version: VERSION,
         online_clients: online,
         active_connections: snap.active_connections,
@@ -228,43 +255,52 @@ async fn system_health(State(state): State<Arc<DashState>>) -> Json<ApiResponse<
 
 // ── /api/v1/config/reload ─────────────────────────────────────────────────────
 
-#[derive(Deserialize, Default)]
-struct ReloadBody {
-    #[serde(rename = "configPath", default)]
-    config_path: String,
-}
-
+/// #3: reload ignores any request body — it re-reads only the config file
+/// recorded at startup. A caller-chosen path was a file-existence probe
+/// (and the old error messages echoed the path and TOML lines), so the
+/// body is not parsed at all and failures are answered generically, with
+/// the detail only in the server log.
 async fn config_reload(
     State(state): State<Arc<DashState>>,
-    body: Option<Json<ReloadBody>>,
-) -> Json<ApiResponse<ConfigReloadResp>> {
-    let body = body.map(|b| b.0).unwrap_or_default();
-
-    let path = if !body.config_path.is_empty() {
-        body.config_path.clone()
-    } else {
-        state.cfg.config_file.clone().unwrap_or_default()
+) -> (StatusCode, Json<ApiResponse<ConfigReloadResp>>) {
+    let Some(path) = state.cfg.config_file.clone() else {
+        return err_resp(
+            400,
+            "no config file path recorded at startup; reload is unavailable",
+            ConfigReloadResp { changed: vec![] },
+        );
     };
-
-    if path.is_empty() {
-        return Json(ApiResponse {
-            code: 400,
-            msg: "configPath not specified and no config file path recorded at startup".into(),
-            data: ConfigReloadResp { changed: vec![] },
-        });
-    }
 
     match state.svc.reload_config_file(&path).await {
         Ok(changed) => {
             tracing::info!(path = %path, ?changed, "config reloaded via dashboard");
-            Json(ApiResponse::ok(ConfigReloadResp { changed }))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(ConfigReloadResp { changed })),
+            )
         }
-        Err(e) => Json(ApiResponse {
-            code: 422,
-            msg: format!("reload failed: {e:#}"),
-            data: ConfigReloadResp { changed: vec![] },
-        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "config reload failed");
+            err_resp(422, reload_error_msg(&e), ConfigReloadResp { changed: vec![] })
+        }
     }
+}
+
+/// #3: reload failures must not echo the config path or a line of the file.
+/// TOML parse errors carry the offending line, so only the bare message is
+/// kept; read errors keep only the fixed prefix. Semantic validation
+/// messages contain neither, so they pass through unchanged.
+fn reload_error_msg(e: &anyhow::Error) -> String {
+    if let Some(parse_err) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<toml::de::Error>())
+    {
+        return format!("config parse error: {}", parse_err.message());
+    }
+    if format!("{e:#}").contains("failed to read config file") {
+        return "failed to read config file".into();
+    }
+    format!("reload failed: {e:#}")
 }
 
 async fn system_info(State(state): State<Arc<DashState>>) -> Json<ApiResponse<SystemInfo>> {
@@ -415,34 +451,33 @@ async fn list_clients(
 async fn get_client(
     State(state): State<Arc<DashState>>,
     Path(session_id): Path<String>,
-) -> Result<Json<ApiResponse<ClientInfo>>, StatusCode> {
-    let session_id = urlencoding_decode(&session_id);
+) -> Result<Json<ApiResponse<ClientInfo>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // #3: axum's `Path` extractor already percent-decodes once; the old
+    // hand-written second decode turned `+` into a space and `%41` into `A`.
     let snap = state.svc.dashboard_snapshot().await;
     match snap.clients.into_iter().find(|c| c.session_id == session_id) {
         Some(c) => Ok(Json(ApiResponse::ok(c))),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(err_resp(404, format!("client not found: {session_id}"), ())),
     }
 }
 
 async fn kick_client(
     State(state): State<Arc<DashState>>,
     Path(session_id): Path<String>,
-) -> Json<ApiResponse<()>> {
-    let session_id = urlencoding_decode(&session_id);
+) -> (StatusCode, Json<ApiResponse<()>>) {
     match state.svc.kick_client(&session_id).await {
-        Ok(()) => Json(ApiResponse::ok(())),
-        Err(e) => Json(ApiResponse { code: 404, msg: e.to_string(), data: () }),
+        Ok(()) => (StatusCode::OK, Json(ApiResponse::ok(()))),
+        Err(e) => err_resp(404, e.to_string(), ()),
     }
 }
 
 async fn delete_client(
     State(state): State<Arc<DashState>>,
     Path(session_id): Path<String>,
-) -> Json<ApiResponse<()>> {
-    let session_id = urlencoding_decode(&session_id);
+) -> (StatusCode, Json<ApiResponse<()>>) {
     match state.svc.kick_client(&session_id).await {
-        Ok(()) => Json(ApiResponse::ok(())),
-        Err(e) => Json(ApiResponse { code: 404, msg: e.to_string(), data: () }),
+        Ok(()) => (StatusCode::OK, Json(ApiResponse::ok(()))),
+        Err(e) => err_resp(404, e.to_string(), ()),
     }
 }
 
@@ -484,23 +519,21 @@ async fn list_tunnels(
 async fn get_tunnel(
     State(state): State<Arc<DashState>>,
     Path(name): Path<String>,
-) -> Result<Json<ApiResponse<TunnelInfo>>, StatusCode> {
-    let name = urlencoding_decode(&name);
+) -> Result<Json<ApiResponse<TunnelInfo>>, (StatusCode, Json<ApiResponse<()>>)> {
     let snap = state.svc.dashboard_snapshot().await;
     match snap.tunnels.into_iter().find(|p| p.name == name) {
         Some(t) => Ok(Json(ApiResponse::ok(t))),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(err_resp(404, format!("tunnel not found: {name}"), ())),
     }
 }
 
 async fn kick_proxy(
     State(state): State<Arc<DashState>>,
     Path(name): Path<String>,
-) -> Json<ApiResponse<()>> {
-    let name = urlencoding_decode(&name);
+) -> (StatusCode, Json<ApiResponse<()>>) {
     match state.svc.kick_proxy(&name).await {
-        Ok(()) => Json(ApiResponse::ok(())),
-        Err(e) => Json(ApiResponse { code: 404, msg: e.to_string(), data: () }),
+        Ok(()) => (StatusCode::OK, Json(ApiResponse::ok(()))),
+        Err(e) => err_resp(404, e.to_string(), ()),
     }
 }
 
@@ -508,49 +541,10 @@ async fn tunnel_traffic(
     State(state): State<Arc<DashState>>,
     Path(name): Path<String>,
     Query(q): Query<TrafficQuery>,
-) -> Result<Json<ApiResponse<TunnelTrafficResp>>, StatusCode> {
-    let name = urlencoding_decode(&name);
+) -> Result<Json<ApiResponse<TunnelTrafficResp>>, (StatusCode, Json<ApiResponse<()>>)> {
     match state.svc.metrics().tunnel_traffic(&name, traffic_window(&q)) {
         Some(hist) => Ok(Json(ApiResponse::ok(traffic_resp(hist)))),
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-fn urlencoding_decode(raw: &str) -> String {
-    percent_decode(raw).unwrap_or_else(|| raw.to_string())
-}
-
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let h = from_hex(bytes[i + 1])?;
-                let l = from_hex(bytes[i + 2])?;
-                out.push((h << 4) | l);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+        None => Err(err_resp(404, format!("tunnel not found: {name}"), ())),
     }
 }
 
@@ -600,10 +594,17 @@ fn bytes_response(content_type: &'static str, body: Vec<u8>) -> Response {
 
 async fn prometheus_metrics(State(state): State<Arc<DashState>>) -> Response {
     let snap = state.svc.dashboard_snapshot().await;
+    // #3: count online clients only — the snapshot also carries offline
+    // records, and `system/stats` already counts online only.
+    let online = snap
+        .clients
+        .iter()
+        .filter(|c| c.status.is_empty() || c.status == "online")
+        .count();
     let mut out = String::new();
     out.push_str("# HELP orbien_clients_online Current number of online clients.\n");
     out.push_str("# TYPE orbien_clients_online gauge\n");
-    out.push_str(&format!("orbien_clients_online {}\n", snap.clients.len()));
+    out.push_str(&format!("orbien_clients_online {}\n", online));
     out.push_str("# HELP orbien_clients_total Total clients seen.\n");
     out.push_str("# TYPE orbien_clients_total gauge\n");
     out.push_str(&format!("orbien_clients_total {}\n", snap.total_client_counts));

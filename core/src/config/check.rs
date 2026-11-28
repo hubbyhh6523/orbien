@@ -103,6 +103,19 @@ impl ServerConfig {
                 out.push("[dashboard-no-auth] dashboard.disableAuth is true".into());
             }
             secret_warning(&mut out, "dashboard.password", &self.dashboard.password);
+            // #3: plain HTTP on a reachable address exposes the Basic Auth
+            // header and login password. Refusing placeholder passwords is
+            // enforced separately; this is the loud warning for the rest.
+            if !super::server::dashboard_addr_is_loopback(&self.dashboard.addr)
+                && !self
+                    .dashboard
+                    .webauthn_origin
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("https://")
+            {
+                out.push("[dashboard-plain-http] dashboard binds a non-loopback address without an https:// origin; Basic Auth and login credentials travel unprotected — put a TLS reverse proxy in front".into());
+            }
         }
         // #13: idleTimeoutSecs == 0 is a deliberate opt-out, but joined
         // connections then have no idle protection at all.

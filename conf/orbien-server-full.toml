@@ -87,3 +87,8 @@ staticDir = ""
 # Optional: persist WebAuthn passkeys to this file so registrations survive
 # restarts (M3). File is JSON, written atomically with 0600. Empty = disabled.
 #passkeyStorePath = "/var/lib/orbien/passkeys.json"
+# Optional: trusted reverse proxies in front of the dashboard (#3), as IPs or
+# CIDRs. Only when a direct peer matches this list are X-Forwarded-For /
+# X-Forwarded-Proto trusted (rate-limit keys, Secure cookie flag).
+# Empty (default) = direct mode, forwarding headers are never trusted.
+#trustedProxies = ["10.0.0.5", "fd00::/64"]

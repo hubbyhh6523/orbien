@@ -332,6 +332,14 @@ pub struct DashboardConfig {
     /// WARNING: Never set this in production.
     #[serde(default, rename = "disableAuth", alias = "disable_auth")]
     pub disable_auth: bool,
+    /// Trusted reverse proxies in front of the dashboard (#3), as IPs or
+    /// CIDRs (e.g. `["10.0.0.5", "fd00::/64"]`). When non-empty,
+    /// `X-Forwarded-For` / `X-Forwarded-Proto` are trusted — but only from
+    /// a direct peer that matches this list — for rate-limit keys and the
+    /// `Secure` cookie flag. Empty (default) means direct mode: forwarding
+    /// headers are never trusted.
+    #[serde(default, rename = "trustedProxies", alias = "trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
     /// Optional path for persisting WebAuthn passkeys (M3). When set, passkey
     /// registrations survive dashboard restarts; the file is JSON, written
     /// with 0600 permissions. Sessions themselves remain in-memory by design
@@ -357,7 +365,15 @@ impl DashboardConfig {
         if !self.enabled() {
             return Ok(());
         }
+        // #3: authentication may only be switched off on loopback. Refusing
+        // here (instead of only warning) because an unauthenticated dashboard
+        // on a reachable address exposes full tunnel/client control.
         if self.disable_auth {
+            if !dashboard_addr_is_loopback(&self.addr) {
+                anyhow::bail!(
+                    "dashboard.disableAuth is true but dashboard.addr is not loopback; refusing to start with authentication disabled on a non-loopback address"
+                );
+            }
             return Ok(());
         }
         let user = self.user.trim();
@@ -368,8 +384,34 @@ impl DashboardConfig {
                  (set dashboard.disableAuth = true to opt out for local dev/testing)"
             );
         }
+        // #3: trusted-proxy entries must parse as IPs or CIDRs, so a typo
+        // fails fast at startup instead of silently disabling the feature.
+        for entry in &self.trusted_proxies {
+            crate::net::Cidr::parse(entry).map_err(|e| {
+                anyhow::anyhow!("dashboard.trustedProxies entry {entry:?} is not an IP or CIDR: {e}")
+            })?;
+        }
         Ok(())
     }
+}
+
+/// #3: `true` for loopback addresses (and `localhost`). Anything else —
+/// including an unparsable hostname — is treated as non-loopback, so the
+/// `disableAuth` refusal above fails closed. Brackets are stripped first:
+/// the dashboard binds `format!("{addr}:{port}")`, so an IPv6 loopback is
+/// spelled `[::1]` in config.
+pub fn dashboard_addr_is_loopback(addr: &str) -> bool {
+    let addr = addr.trim();
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = addr
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(addr);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -844,4 +886,23 @@ fn listen_addrs_overlap(a: &str, b: &str) -> bool {
 
 fn is_unspecified_bind(addr: &str) -> bool {
     matches!(addr, "0.0.0.0" | "::" | "[::]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dashboard_addr_is_loopback;
+
+    #[test]
+    fn loopback_detection() {
+        assert!(dashboard_addr_is_loopback("127.0.0.1"));
+        assert!(dashboard_addr_is_loopback("::1"));
+        assert!(dashboard_addr_is_loopback("[::1]"));
+        assert!(dashboard_addr_is_loopback("localhost"));
+        assert!(dashboard_addr_is_loopback("  127.0.0.1  "));
+        assert!(!dashboard_addr_is_loopback("0.0.0.0"));
+        assert!(!dashboard_addr_is_loopback("192.168.1.1"));
+        assert!(!dashboard_addr_is_loopback("example.com"));
+        assert!(!dashboard_addr_is_loopback("[::]"));
+        assert!(!dashboard_addr_is_loopback(""));
+    }
 }

@@ -63,12 +63,54 @@ password = "123456"
 
 Monitor 页会展示每个 token 的活跃控制连接数，以及 `allowed_tunnels`、`allowed_protocols`、`allowed_remote_ports`。配置了策略但当前没有连接的 token 也会列出。
 
+## API 响应约定
+
+所有 `/api/v1/` 接口返回统一信封 `{ code, msg, data }`，列表为
+`{ total, page, pageSize, items }`（`page` 从 1 开始，`pageSize` 钳制在
+1~200，默认 50）。**HTTP 状态码与信封里的 `code` 一致**：出错时不再
+返回 HTTP 200 嵌一个错误 `code`，而是直接返回对应的状态码（404、422
+等），`msg` 里是错误原因。未知 `/api/*` 路径返回 JSON 404，永远不会
+回落到前端 `index.html`。
+
+## 踢出客户端
+
+`DELETE /api/v1/clients/:id`（或 `POST /api/v1/clients/:id/kick`）断开
+客户端的控制连接，`DELETE /api/v1/proxies/:name` 断开一条隧道：
+
+- 被踢的客户端**直接退出，不会自动重连**，需要手动重新启动；正常断线
+  （非踢出）才会按退避策略重连。
+- 重复删除同一个客户端或隧道返回 404（`client not online` /
+  `proxy not found`）。
+- 踢出与客户端断线竞态时，若客户端已不在先，同样返回 404。
+
+## 安全说明
+
+- `disableAuth = true` 只允许在 loopback 地址上启动；配在非 loopback
+  地址上服务器会拒绝启动。
+- Dashboard 绑在非 loopback 地址、且没有 `https://` origin 时，启动会
+  打出警告：Basic Auth 头与登录密码在明文 HTTP 上是裸奔的，请在前面放
+  一个 TLS 反向代理。占位密码（如 `CHANGE_ME`）启动时直接拒绝。
+- `GET /metrics` 与 `/api/` 走同一套鉴权（会话 Cookie 或 Basic Auth），
+  不再公开；抓取时必须提供凭据。
+- 登录与 Basic Auth 失败共享同一个限流器：同一来源 60 秒内失败 8 次
+  后会被限流（429），窗口过去之前即使凭据正确也会被拒绝；IPv6 按 /64
+  前缀共享桶。
+- 浏览器跨站请求会被拦截：`POST` / `PUT` / `DELETE` 带有与 `Host`
+  不符的 `Origin`、或 `Sec-Fetch-Site: cross-site` 时返回 403；不带
+  这些头的调用（如 curl）不受影响。
+- 反向代理部署：`trustedProxies` 列出可信代理的 IP 或 CIDR，只有直连
+  对端本身在列表里时才采信 `X-Forwarded-For` / `X-Forwarded-Proto`
+  （用于限流键与 Cookie 的 `Secure` 标记）；不配时转发头一律忽略。
+- WebAuthn 待处理态 120 秒过期、最多 64 个，`login/begin` 按地址限流；
+  注册 passkey 只允许给当前登录用户（会话）或配置的 dashboard 用户
+  （Basic Auth）注册。
+
 ## Prometheus 监控
 
-服务端内置 Prometheus 指标端点 `GET /metrics`，以标准文本格式暴露监控指标，可直接被 Prometheus / Grafana 抓取。
+服务端内置 Prometheus 指标端点 `GET /metrics`，以标准文本格式暴露监控指标，可直接被 Prometheus / Grafana 抓取。**该端点需要鉴权**（会话 Cookie 或 Basic Auth），不再公开。
 
 ```shell
-curl http://SERVER_IP:8020/metrics
+curl -u admin:123456 http://SERVER_IP:8020/metrics
 ```
 
 返回示例：
@@ -108,5 +150,5 @@ scrape_configs:
     metrics_path: /metrics
 ```
 
-> 注意：`/metrics` 与 dashboard 共用同一 Web 服务端口。若配置了 Basic Auth，抓取时需提供凭据（可通过 `basic_auth` 字段或反向代理注入）。
+> 注意：`/metrics` 与 dashboard 共用同一 Web 服务端口，且需要鉴权。抓取时需提供凭据（可通过 `basic_auth` 字段或反向代理注入）。
 

@@ -14,12 +14,13 @@
 use crate::dashboard::DashState;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use orbien_core::net::Cidr;
 use rand::RngExt;
 use std::{
     collections::HashMap,
@@ -45,6 +46,10 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 const COOKIE_NAME: &str = "orbien_session";
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const LOGIN_MAX_ATTEMPTS: u32 = 8;
+/// #3: pending WebAuthn states expire with the 120 s state cookie, and are
+/// capped so repeated `begin` calls cannot grow memory until restart.
+const WA_STATE_TTL: Duration = Duration::from_secs(120);
+const MAX_PENDING_WA_STATES: usize = 64;
 
 use webauthn_rs::prelude::Passkey;
 
@@ -53,8 +58,10 @@ use webauthn_rs::prelude::Passkey;
 pub struct AuthState {
     sessions: DashMap<String, Session>,
     passkeys: DashMap<String, Vec<Passkey>>,
-    reg_states: DashMap<String, PasskeyRegistration>,
-    auth_states: DashMap<String, PasskeyAuthentication>,
+    /// Pending states carry their creation time (#3: they expire with the
+    /// 120 s state cookie instead of living until restart).
+    reg_states: DashMap<String, (PasskeyRegistration, Instant)>,
+    auth_states: DashMap<String, (PasskeyAuthentication, Instant)>,
     login_attempts: DashMap<String, (u32, Instant)>,
     pub webauthn: Option<Webauthn>,
     /// M3: when set, passkeys are persisted to this JSON file (0600) on every
@@ -127,10 +134,13 @@ impl AuthState {
             .collect();
         match serde_json::to_vec_pretty(&map) {
             Ok(bytes) => {
-                // Write to a temp file then rename for atomicity.
+                // Write to a temp file then rename for atomicity. #3: the
+                // temp file is created 0600 from the start — the old code
+                // wrote it with default permissions and chmodded only after
+                // the rename, leaving a window where other users could read it.
                 let tmp = path.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &bytes)
-                    .and_then(|_| std::fs::rename(&tmp, path))
+                if let Err(e) =
+                    write_private(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path))
                 {
                     tracing::warn!(path = %path.display(), "passkey store write failed: {e}");
                 }
@@ -246,20 +256,50 @@ impl AuthState {
 
     // ── pending state helpers ─────────────────────────────────────────────────
 
-    pub fn save_reg_state(&self, username: &str, state: PasskeyRegistration) {
-        self.reg_states.insert(username.to_string(), state);
+    /// #3: pending states expire after `WA_STATE_TTL` and are capped, so a
+    /// flood of `begin` calls stays bounded. Returns `false` when the cap is
+    /// hit (caller answers 429); expired entries are swept first.
+    pub fn save_reg_state(&self, username: &str, state: PasskeyRegistration) -> bool {
+        self.evict_expired_wa_states();
+        if self.reg_states.len() >= MAX_PENDING_WA_STATES {
+            return false;
+        }
+        self.reg_states
+            .insert(username.to_string(), (state, Instant::now()));
+        true
     }
 
     pub fn take_reg_state(&self, username: &str) -> Option<PasskeyRegistration> {
-        self.reg_states.remove(username).map(|(_, v)| v)
+        let (_, (state, created)) = self.reg_states.remove(username)?;
+        if wa_state_expired(created) {
+            return None;
+        }
+        Some(state)
     }
 
-    pub fn save_auth_state(&self, key: &str, state: PasskeyAuthentication) {
-        self.auth_states.insert(key.to_string(), state);
+    pub fn save_auth_state(&self, key: &str, state: PasskeyAuthentication) -> bool {
+        self.evict_expired_wa_states();
+        if self.auth_states.len() >= MAX_PENDING_WA_STATES {
+            return false;
+        }
+        self.auth_states
+            .insert(key.to_string(), (state, Instant::now()));
+        true
     }
 
     pub fn take_auth_state(&self, key: &str) -> Option<PasskeyAuthentication> {
-        self.auth_states.remove(key).map(|(_, v)| v)
+        let (_, (state, created)) = self.auth_states.remove(key)?;
+        if wa_state_expired(created) {
+            return None;
+        }
+        Some(state)
+    }
+
+    fn evict_expired_wa_states(&self) {
+        self.reg_states
+            .retain(|_, (_, created)| !wa_state_expired(*created));
+        self.auth_states
+            .retain(|_, (_, created)| !wa_state_expired(*created));
     }
 
     pub fn login_allowed(&self, key: &str) -> bool {
@@ -293,6 +333,34 @@ impl AuthState {
     }
 }
 
+/// Write `bytes` to `path`, creating it with mode 0600 on unix so no other
+/// user can read it even briefly (#3).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// #3: a pending WebAuthn state is usable only within the state-cookie
+/// lifetime. Kept as a pure predicate so the rule is unit-testable without
+/// fabricating a `PasskeyAuthentication` value.
+fn wa_state_expired(created: Instant) -> bool {
+    created.elapsed() > WA_STATE_TTL
+}
+
 fn random_token() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -314,17 +382,46 @@ pub async fn auth_middleware(
 ) -> Result<Response, Response> {
     let path = req.uri().path();
 
-    if path.starts_with("/api/v1/auth/") || path == "/healthz" {
+    // Liveness probe: public by design.
+    if path == "/healthz" {
         return Ok(next.run(req).await);
     }
 
-    if !path.starts_with("/api/") {
+    // #3: `/metrics` is protected like `/api/` — it used to be public
+    // because the middleware only checked `/api/` paths. Everything else
+    // (the SPA, static assets) stays public.
+    let protected = path.starts_with("/api/") || path == "/metrics";
+    if !protected {
+        return Ok(next.run(req).await);
+    }
+
+    // #3: cross-site guard for unsafe methods. `SameSite` cookies do not
+    // protect the Basic Auth path, and a forged POST from another origin
+    // must not reach a handler. Missing headers (curl, API clients) pass.
+    if matches!(
+        *req.method(),
+        axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE
+    ) && is_cross_site(&req)
+    {
+        return Err((StatusCode::FORBIDDEN, "cross-site request forbidden").into_response());
+    }
+
+    // Auth endpoints are public by design (login, status, WebAuthn).
+    if path.starts_with("/api/v1/auth/") {
         return Ok(next.run(req).await);
     }
 
     if state.cfg.disable_auth {
         return Ok(next.run(req).await);
     }
+
+    // Peer for rate limiting: injected by
+    // `into_make_service_with_connect_info` (oneshot tests insert it too).
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let key = client_key(req.headers(), peer, &state.trusted_proxies);
 
     if let Some(auth) = &state.auth {
         if let Some(token) = extract_cookie(req.headers(), COOKIE_NAME) {
@@ -334,8 +431,28 @@ pub async fn auth_middleware(
         }
     }
 
-    if needs_basic_auth(&state) && basic_auth_ok(&state, req.headers()) {
-        return Ok(next.run(req).await);
+    if needs_basic_auth(&state) {
+        if let Some(auth) = &state.auth {
+            // #3: Basic Auth failures count against the same limiter as
+            // logins — once limited, even correct credentials are rejected
+            // until the window passes.
+            if !auth.login_allowed(&key) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many authentication attempts",
+                )
+                    .into_response());
+            }
+        }
+        if basic_auth_ok(&state, req.headers()) {
+            if let Some(auth) = &state.auth {
+                auth.clear_login_failures(&key);
+            }
+            return Ok(next.run(req).await);
+        }
+        if let Some(auth) = &state.auth {
+            auth.record_login_failure(&key);
+        }
     }
 
     let mut res = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -344,6 +461,42 @@ pub async fn auth_middleware(
         HeaderValue::from_static("Basic realm=\"Restricted\""),
     );
     Err(res)
+}
+
+/// #3: `true` when the request is cross-site — `Sec-Fetch-Site: cross-site`,
+/// or an `Origin` whose host differs from the request `Host`. Missing
+/// headers mean "not a browser" and are allowed.
+fn is_cross_site(req: &Request<Body>) -> bool {
+    let headers = req.headers();
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        if site.eq_ignore_ascii_case("cross-site") {
+            return true;
+        }
+    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(origin_host) = origin
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_string))
+    else {
+        return true; // malformed Origin — fail closed
+    };
+    !origin_host.eq_ignore_ascii_case(host_without_port(host))
+}
+
+fn host_without_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    host.split(':').next().unwrap_or(host)
 }
 
 // ── cookie helpers ────────────────────────────────────────────────────────────
@@ -359,14 +512,16 @@ pub fn extract_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<Str
     None
 }
 
-/// 安全开关：直连部署（无可信反代）时必须为 false——X-Forwarded-* 头完全由客户端控制。
-/// 仅当 dashboard 部署在可信代理之后（代理会清洗/设置这些头）才置 true。
-pub const TRUSTED_PROXY_ENABLED: bool = false;
-
-pub fn cookie_secure(headers: &axum::http::HeaderMap, origin: &str) -> bool {
-    // M1 修复：直连模式下 X-Forwarded-Proto 可被客户端伪造以剥离 Cookie Secure 标记，
-    // 因此仅显式启用可信代理时才读取转发头。
-    if TRUSTED_PROXY_ENABLED {
+/// #3: the `Secure` cookie flag. `X-Forwarded-Proto` is read only when a
+/// trusted proxy is configured (a non-empty trusted list); in direct mode
+/// the header is attacker-controlled and ignored, and the configured
+/// origin decides.
+pub fn cookie_secure(
+    headers: &axum::http::HeaderMap,
+    origin: &str,
+    trusted_proxies: &[Cidr],
+) -> bool {
+    if !trusted_proxies.is_empty() {
         if let Some(proto) = headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
@@ -421,6 +576,12 @@ fn needs_basic_auth(state: &DashState) -> bool {
 }
 
 pub fn credentials_match(expected_user: &str, expected_pass: &str, user: &str, pass: &str) -> bool {
+    // #3: an empty configured credential never matches — even an empty
+    // submitted one. Startup validation already refuses empty credentials;
+    // this is defense in depth.
+    if expected_user.is_empty() || expected_pass.is_empty() {
+        return false;
+    }
     constant_time_eq(user.as_bytes(), expected_user.as_bytes())
         && constant_time_eq(pass.as_bytes(), expected_pass.as_bytes())
 }
@@ -462,24 +623,59 @@ fn basic_auth_ok(state: &DashState, headers: &axum::http::HeaderMap) -> bool {
     credentials_match(&state.cfg.user, &state.cfg.password, u, p)
 }
 
-/// M2 修复：直连模式下 X-Forwarded-For 完全可伪造，登录限速键若采信该头即可被
-/// 无限速爆破。仅可信代理模式下读取转发头；`peer_ip` 是不可伪造的真实对端地址，
-/// 由调用方从 ConnectInfo 传入。
-pub fn client_key(headers: &axum::http::HeaderMap, peer_ip: Option<IpAddr>) -> String {
-    if TRUSTED_PROXY_ENABLED {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next_back())
-            .map(str::trim)
-            .filter(|v| v.parse::<IpAddr>().is_ok())
-        {
-            return forwarded.to_string();
+/// #3: rate-limit key for one peer. `X-Forwarded-For` is trusted only when
+/// the direct peer is itself a configured trusted proxy; otherwise the
+/// (unforgeable) peer address is used. IPv6 collapses to its /64 prefix so
+/// rotating addresses inside one /64 shares a bucket; IPv4-mapped IPv6
+/// normalizes to IPv4 first (same rule as #15's deny check).
+pub fn client_key(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxies: &[Cidr],
+) -> String {
+    if !trusted_proxies.is_empty() {
+        if let Some(peer) = peer_ip {
+            let peer = normalize_ip(peer);
+            if trusted_proxies.iter().any(|c| c.contains(peer)) {
+                if let Some(forwarded) = headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(',').next_back())
+                    .map(str::trim)
+                    .filter(|v| v.parse::<IpAddr>().is_ok())
+                {
+                    let fwd: IpAddr = forwarded.parse().unwrap();
+                    return format!("proxy:{}", limiter_ip_key(fwd));
+                }
+            }
         }
     }
     match peer_ip {
-        Some(ip) => format!("direct:{ip}"),
+        Some(ip) => format!("direct:{}", limiter_ip_key(ip)),
         None => "direct:unknown".to_string(),
+    }
+}
+
+/// #3: one address folded into its limiter bucket — IPv4 as-is, IPv6 as its
+/// /64 prefix.
+fn limiter_ip_key(ip: IpAddr) -> String {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            format!("{}/64", std::net::Ipv6Addr::from(octets))
+        }
+    }
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
     }
 }
 
@@ -493,11 +689,11 @@ mod tests {
         Some(s.parse().unwrap())
     }
 
-    // 直连模式（TRUSTED_PROXY_ENABLED=false）：转发头一律不采信
+    // 直连模式（trusted_proxies 为空）：转发头一律不采信
     #[test]
     fn client_key_no_header() {
         let headers = HeaderMap::new();
-        assert_eq!(client_key(&headers, ip("10.0.0.9")), "direct:10.0.0.9");
+        assert_eq!(client_key(&headers, ip("10.0.0.9"), &[]), "direct:10.0.0.9");
     }
 
     #[test]
@@ -505,30 +701,30 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
         // 伪造的转发头必须被忽略——限速键只由真实对端 IP 决定
-        assert_eq!(client_key(&h, ip("203.0.113.7")), "direct:203.0.113.7");
+        assert_eq!(client_key(&h, ip("203.0.113.7"), &[]), "direct:203.0.113.7");
     }
 
     #[test]
     fn client_key_direct_mode_attacker_cannot_bypass_rate_limit() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "10.0.0.1, 203.0.113.5".parse().unwrap());
-        assert_eq!(client_key(&h, ip("198.51.100.9")), "direct:198.51.100.9");
+        assert_eq!(client_key(&h, ip("198.51.100.9"), &[]), "direct:198.51.100.9");
         h.insert("x-forwarded-for", "10.0.0.2, 203.0.113.5".parse().unwrap());
         // 攻击者换任何伪造头，真实对端 IP 不变 → 限速键稳定
-        assert_eq!(client_key(&h, ip("198.51.100.9")), "direct:198.51.100.9");
+        assert_eq!(client_key(&h, ip("198.51.100.9"), &[]), "direct:198.51.100.9");
     }
 
     #[test]
     fn client_key_direct_mode_no_peer_falls_back() {
         let headers = HeaderMap::new();
-        assert_eq!(client_key(&headers, None), "direct:unknown");
+        assert_eq!(client_key(&headers, None, &[]), "direct:unknown");
     }
 
     #[test]
     fn client_key_direct_mode_invalid_header_still_ignored() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "garbage".parse().unwrap());
-        assert_eq!(client_key(&h, ip("192.0.2.1")), "direct:192.0.2.1");
+        assert_eq!(client_key(&h, ip("192.0.2.1"), &[]), "direct:192.0.2.1");
     }
 
     #[test]
@@ -536,19 +732,63 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "1.2.3.4 ,  203.0.113.5  ".parse().unwrap());
         // 即便格式合法，直连模式也不采信
-        assert_eq!(client_key(&h, ip("198.51.100.9")), "direct:198.51.100.9");
+        assert_eq!(client_key(&h, ip("198.51.100.9"), &[]), "direct:198.51.100.9");
+    }
+
+    // #3: IPv6 限速键按 /64 折叠，同一 /64 内的地址共享桶
+    #[test]
+    fn client_key_ipv6_shares_bucket_within_slash64() {
+        let headers = HeaderMap::new();
+        let a = client_key(&headers, ip("2001:db8::1"), &[]);
+        let b = client_key(&headers, ip("2001:db8::2"), &[]);
+        let c = client_key(&headers, ip("2001:db9::1"), &[]);
+        assert_eq!(a, "direct:2001:db8::/64");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn client_key_ipv4_mapped_normalizes_to_ipv4() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            client_key(&headers, ip("::ffff:10.0.0.9"), &[]),
+            "direct:10.0.0.9"
+        );
+    }
+
+    // #3: 只有直连对端本身在可信列表里时才采信 X-Forwarded-For
+    #[test]
+    fn client_key_trusted_proxy_uses_forwarded_for() {
+        let trusted = vec![Cidr::parse("10.0.0.5").unwrap()];
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            client_key(&h, ip("10.0.0.5"), &trusted),
+            "proxy:203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn client_key_untrusted_peer_ignores_forwarded_for() {
+        let trusted = vec![Cidr::parse("10.0.0.5").unwrap()];
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            client_key(&h, ip("198.51.100.9"), &trusted),
+            "direct:198.51.100.9"
+        );
     }
 
     #[test]
     fn cookie_secure_no_header_http() {
         let h = HeaderMap::new();
-        assert!(!cookie_secure(&h, "http://example.com"));
+        assert!(!cookie_secure(&h, "http://example.com", &[]));
     }
 
     #[test]
     fn cookie_secure_no_header_https() {
         let h = HeaderMap::new();
-        assert!(cookie_secure(&h, "https://example.com"));
+        assert!(cookie_secure(&h, "https://example.com", &[]));
     }
 
     // 直连模式：伪造/合法的 x-forwarded-proto 都不影响 Secure 判定
@@ -556,13 +796,43 @@ mod tests {
     fn cookie_secure_direct_mode_ignores_forwarded_proto() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-proto", "http, https".parse().unwrap());
-        assert!(!cookie_secure(&h, "http://example.com"));
+        assert!(!cookie_secure(&h, "http://example.com", &[]));
     }
 
     #[test]
     fn cookie_secure_direct_mode_attacker_cannot_upgrade() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert!(!cookie_secure(&h, "http://example.com"));
+        assert!(!cookie_secure(&h, "http://example.com", &[]));
+    }
+
+    // #3: 配置了可信代理时 X-Forwarded-Proto 决定 Secure 标记
+    #[test]
+    fn cookie_secure_trusted_proxy_reads_forwarded_proto() {
+        let trusted = vec![Cidr::parse("10.0.0.5").unwrap()];
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(cookie_secure(&h, "http://example.com", &trusted));
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!cookie_secure(&h, "https://example.com", &trusted));
+    }
+
+    // #3: 待处理 WebAuthn 态 120 秒后过期
+    #[test]
+    fn wa_state_expiry_predicate() {
+        assert!(!wa_state_expired(Instant::now()));
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(121))
+            .unwrap();
+        assert!(wa_state_expired(old));
+    }
+
+    // #3: 空的配置凭据永远不匹配，哪怕提交的也是空的
+    #[test]
+    fn credentials_match_rejects_empty_expected() {
+        assert!(!credentials_match("", "", "", ""));
+        assert!(!credentials_match("admin", "", "admin", ""));
+        assert!(credentials_match("admin", "secret", "admin", "secret"));
+        assert!(!credentials_match("admin", "secret", "admin", "wrong"));
     }
 }

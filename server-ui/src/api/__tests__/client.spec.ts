@@ -38,6 +38,29 @@ describe('api internals – fetch integration', () => {
     await expect(fetchSystemInfo()).rejects.toMatchObject({code: 'http', params: {status: 500}})
   })
 
+  it('carries the server msg on a non-ok JSON response', async () => {
+    vi.stubGlobal('fetch', mockFetch(404, {code: 404, msg: 'tunnel not found: web', data: null}, false))
+    const {fetchSystemInfo} = await importClient()
+    await expect(fetchSystemInfo()).rejects.toMatchObject({
+      code: 'http',
+      params: {status: 404, msg: 'tunnel not found: web'},
+    })
+  })
+
+  it('falls back to statusText when the error body is not JSON', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+      json: () => Promise.reject(new SyntaxError('not json')),
+    }))
+    const {fetchSystemInfo} = await importClient()
+    await expect(fetchSystemInfo()).rejects.toMatchObject({
+      code: 'http',
+      params: {status: 403, statusText: 'Forbidden'},
+    })
+  })
+
   it('throws ApiError(api) when body.code !== 200', async () => {
     vi.stubGlobal('fetch', mockFetch(200, {code: 400, msg: 'bad request', data: null}))
     const {fetchSystemInfo} = await importClient()
@@ -329,16 +352,16 @@ describe('reloadConfig', () => {
     )
   })
 
-  it('passes configPath when provided', async () => {
+  it('never sends configPath', async () => {
     const spy = mockFetch(200, {code: 200, msg: 'ok', data: {changed: ['auth']}})
     vi.stubGlobal('fetch', spy)
     const {reloadConfig} = await importClient()
-    await reloadConfig('/etc/orbien/server.toml').catch(() => {})
+    await reloadConfig().catch(() => {})
     expect(spy).toHaveBeenCalledWith(
       '/api/v1/config/reload',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({configPath: '/etc/orbien/server.toml'}),
+        body: '{}',
       }),
     )
   })
