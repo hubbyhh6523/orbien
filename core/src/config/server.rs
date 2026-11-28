@@ -301,6 +301,43 @@ impl Default for ServerTransportConfig {
     }
 }
 
+/// Scope of a dashboard API key (#3, slice 2). `read` keys may only call
+/// `GET` (and `HEAD`) endpoints; `read-write` keys may also call `POST` /
+/// `PUT` / `DELETE` (reload, kick, delete). Default is `read` — least
+/// privilege when the operator omits the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub enum ApiKeyScope {
+    #[serde(rename = "read")]
+    #[default]
+    Read,
+    #[serde(rename = "read-write")]
+    ReadWrite,
+}
+
+impl ApiKeyScope {
+    pub fn allows_write(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
+/// One dashboard API key, as written in the config file (#3, slice 2).
+/// The plaintext `key` lives only here (at rest, like `dashboard.password`):
+/// the runtime store keeps only its SHA-256 hash — see
+/// `server::dashboard::api_keys`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub scope: ApiKeyScope,
+}
+
+/// Minimum key length: 32 characters is the 128-bit bar for a hex key
+/// (`openssl rand -hex 16`); operators should use `openssl rand -hex 32`.
+pub const API_KEY_MIN_LEN: usize = 32;
+
 /// Dashboard web server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -346,6 +383,12 @@ pub struct DashboardConfig {
     /// (short-lived, restart invalidation is acceptable and safer).
     #[serde(default, rename = "passkeyStorePath", alias = "passkey_store_path")]
     pub passkey_store_path: String,
+    /// API keys for programmatic dashboard access (#3, slice 2). Each entry
+    /// is `{ name, key, scope }` with scope `read` (default, GET only) or
+    /// `read-write`. Keys are sent as `Authorization: Bearer <key>`; the
+    /// runtime stores only their SHA-256 hashes. Empty by default.
+    #[serde(default, rename = "apiKeys", alias = "api_keys")]
+    pub api_keys: Vec<ApiKeyConfig>,
 }
 
 impl DashboardConfig {
@@ -390,6 +433,25 @@ impl DashboardConfig {
             crate::net::Cidr::parse(entry).map_err(|e| {
                 anyhow::anyhow!("dashboard.trustedProxies entry {entry:?} is not an IP or CIDR: {e}")
             })?;
+        }
+        // #3, slice 2: API keys are validated here so a bad key fails
+        // startup — and, via `prepare_config`, the whole reload atomically.
+        // (When the dashboard is disabled the keys are inert, so there is
+        // nothing to validate.)
+        let mut names = std::collections::HashSet::new();
+        for k in &self.api_keys {
+            let name = k.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("dashboard.apiKeys entry has an empty name");
+            }
+            if !names.insert(name.to_string()) {
+                anyhow::bail!("dashboard.apiKeys has a duplicate name {name:?}");
+            }
+            if k.key.len() < API_KEY_MIN_LEN {
+                anyhow::bail!(
+                    "dashboard.apiKeys entry {name:?} key is too short (at least {API_KEY_MIN_LEN} characters; generate one with `openssl rand -hex 32`)"
+                );
+            }
         }
         Ok(())
     }
@@ -891,6 +953,27 @@ fn is_unspecified_bind(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::dashboard_addr_is_loopback;
+    use super::{ApiKeyConfig, ApiKeyScope, DashboardConfig};
+
+    fn enabled_dash(api_keys: Vec<ApiKeyConfig>) -> DashboardConfig {
+        DashboardConfig {
+            port: 8020,
+            user: "admin".into(),
+            password: "secret".into(),
+            api_keys,
+            ..Default::default()
+        }
+    }
+
+    fn key(name: &str, key: &str, scope: ApiKeyScope) -> ApiKeyConfig {
+        ApiKeyConfig {
+            name: name.into(),
+            key: key.into(),
+            scope,
+        }
+    }
+
+    const LONG_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn loopback_detection() {
@@ -904,5 +987,53 @@ mod tests {
         assert!(!dashboard_addr_is_loopback("example.com"));
         assert!(!dashboard_addr_is_loopback("[::]"));
         assert!(!dashboard_addr_is_loopback(""));
+    }
+
+    // #3, slice 2: API key validation
+    #[test]
+    fn api_keys_valid_and_scope_default_is_read() {
+        let dash = enabled_dash(vec![key("ops", LONG_KEY, ApiKeyScope::ReadWrite)]);
+        assert!(dash.validate().is_ok());
+        // Omitted scope deserializes to `read`.
+        let parsed: DashboardConfig =
+            toml::from_str("port = 8020\nuser = 'a'\npassword = 'b'\n[[apiKeys]]\nname = 'ro'\nkey = '0123456789abcdef0123456789abcdef'\n").unwrap();
+        assert_eq!(parsed.api_keys.len(), 1);
+        assert_eq!(parsed.api_keys[0].scope, ApiKeyScope::Read);
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn api_keys_reject_short_empty_and_duplicate() {
+        assert!(enabled_dash(vec![key("a", "short", ApiKeyScope::Read)])
+            .validate()
+            .is_err());
+        assert!(enabled_dash(vec![key("", LONG_KEY, ApiKeyScope::Read)])
+            .validate()
+            .is_err());
+        assert!(enabled_dash(vec![
+            key("dup", LONG_KEY, ApiKeyScope::Read),
+            key("dup", LONG_KEY, ApiKeyScope::ReadWrite),
+        ])
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn api_keys_unknown_scope_rejected_at_parse() {
+        let parsed: Result<DashboardConfig, _> = toml::from_str(
+            "port = 8020\nuser = 'a'\npassword = 'b'\n[[apiKeys]]\nname = 'x'\nkey = '0123456789abcdef0123456789abcdef'\nscope = 'admin'\n",
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn api_keys_not_validated_when_dashboard_disabled() {
+        // Inert keys on a disabled dashboard are not rejected — same
+        // treatment as user/password, which are only required when enabled.
+        let dash = DashboardConfig {
+            api_keys: vec![key("a", "short", ApiKeyScope::Read)],
+            ..Default::default()
+        };
+        assert!(dash.validate().is_ok());
     }
 }

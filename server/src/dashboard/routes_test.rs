@@ -19,7 +19,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
-use orbien_core::config::{DashboardConfig, ServerConfig};
+use orbien_core::config::{ApiKeyConfig, ApiKeyScope, DashboardConfig, ServerConfig};
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -843,5 +843,177 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert_eq!(location, "/");
+    }
+
+    // ── #3, slice 2: API keys ─────────────────────────────────────────────────
+
+    const READ_KEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const WRITE_KEY: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const UNKNOWN_KEY: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// State with auth on and two API keys in the server config (the store
+    /// is built by `Service::new` from `cfg.dashboard.api_keys`).
+    fn make_state_with_api_keys() -> Arc<DashState> {
+        let mut cfg = ServerConfig::default();
+        cfg.dashboard.api_keys = vec![
+            ApiKeyConfig {
+                name: "ro".into(),
+                key: READ_KEY.into(),
+                scope: ApiKeyScope::Read,
+            },
+            ApiKeyConfig {
+                name: "rw".into(),
+                key: WRITE_KEY.into(),
+                scope: ApiKeyScope::ReadWrite,
+            },
+        ];
+        let svc = Arc::new(Service::new(cfg).expect("Service::new"));
+        let web_cfg = DashboardConfig {
+            addr: "127.0.0.1".into(),
+            port: 8020,
+            user: "admin".into(),
+            password: "secret".into(),
+            disable_auth: false,
+            ..Default::default()
+        };
+        Arc::new(DashState {
+            svc,
+            cfg: web_cfg,
+            auth: Some(Arc::new(AuthState::session_only())),
+            trusted_proxies: vec![],
+        })
+    }
+
+    fn bearer(method: &str, uri: &str, key: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bearer_read_key_can_get() {
+        let state = make_state_with_api_keys();
+        let (status, json) = call(
+            state.clone(),
+            bearer("GET", "/api/v1/system/info", READ_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["code"], 200);
+        let (status, _) = call(state, bearer("GET", "/metrics", READ_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_read_key_cannot_write() {
+        let state = make_state_with_api_keys();
+        // Middleware rejections are plain-text (like slice 1's 401/429s),
+        // not the JSON envelope — assert the status only.
+        for (method, uri) in [
+            ("POST", "/api/v1/config/reload"),
+            ("POST", "/api/v1/clients/some-id/kick"),
+            ("DELETE", "/api/v1/clients/some-id"),
+            ("DELETE", "/api/v1/proxies/some-proxy"),
+        ] {
+            let (status, _) = call(state.clone(), bearer(method, uri, READ_KEY)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_read_write_key_can_write() {
+        let state = make_state_with_api_keys();
+        // Reload has no config file recorded in this state, so the handler
+        // answers 400 — reaching the handler at all proves the scope check
+        // passed (a read key gets 403 instead).
+        let (status, _) = call(
+            state.clone(),
+            bearer("POST", "/api/v1/config/reload", WRITE_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Kick of an unknown client reaches the handler too (404, not 403).
+        let (status, _) = call(
+            state,
+            bearer("POST", "/api/v1/clients/no-such-id/kick", WRITE_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn bearer_unknown_key_is_unauthorized() {
+        let state = make_state_with_api_keys();
+        let (status, _) = call(
+            state,
+            bearer("GET", "/api/v1/system/info", UNKNOWN_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_does_not_leak_keys_in_tokens_response() {
+        let state = make_state_with_api_keys();
+        let (status, json) = call(
+            state,
+            bearer("GET", "/api/v1/system/tokens", READ_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(!body.contains(READ_KEY));
+        assert!(!body.contains(WRITE_KEY));
+    }
+
+    #[tokio::test]
+    async fn session_cookie_and_basic_auth_still_full_access() {
+        use base64::Engine;
+        let state = make_state_with_api_keys();
+        // Session cookie: full access (write reaches the handler → 400).
+        let token = state
+            .auth
+            .as_ref()
+            .unwrap()
+            .create_session("admin");
+        let req = Request::post("/api/v1/config/reload")
+            .header("cookie", format!("orbien_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Basic Auth: same.
+        let encoded = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let req = Request::post("/api/v1/config/reload")
+            .header("authorization", format!("Basic {encoded}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn per_key_write_limit_blocks_after_sixty() {
+        let state = make_state_with_api_keys();
+        for i in 0..60 {
+            let (status, _) = call(
+                state.clone(),
+                bearer("POST", "/api/v1/config/reload", WRITE_KEY),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "write {i} must reach handler");
+        }
+        let (status, _) = call(
+            state,
+            bearer("POST", "/api/v1/config/reload", WRITE_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 }

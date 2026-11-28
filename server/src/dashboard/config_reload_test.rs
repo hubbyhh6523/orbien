@@ -1,6 +1,7 @@
 use super::{auth, routes, DashState};
 use crate::service::Service;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
@@ -269,4 +270,175 @@ async fn reload_ignores_config_path_body() {
     assert_eq!(result["data"]["changed"], json!([]));
     let policy = state.svc.access_policy().await;
     assert!(!policy.is_denied("127.0.0.1".parse().unwrap()));
+}
+
+// ── #3, slice 2: API keys through reload ─────────────────────────────────────
+
+const READ_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const WRITE_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const EXTRA_KEY: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+/// Render a full server config with the given dashboard API keys
+/// (`(name, key, scope)` triples).
+fn keys_toml(keys: &[(&str, &str, &str)]) -> String {
+    let mut s = String::from("[dashboard]\nport = 8020\nuser = 'admin'\npassword = 'secret'\n");
+    for (name, key, scope) in keys {
+        s.push_str(&format!(
+            "[[dashboard.apiKeys]]\nname = '{name}'\nkey = '{key}'\nscope = '{scope}'\n"
+        ));
+    }
+    s.push_str(
+        "[[auth.token_policies]]\ntoken = 'stable-token'\nallowed_tunnels = ['db']\nallowed_protocols = ['tcp']\nallowed_remote_ports = [3306]\n",
+    );
+    s
+}
+
+/// Like `state()`, but with auth on and two API keys in the startup file,
+/// so Bearer calls exercise the middleware.
+fn key_state() -> (Arc<DashState>, ConfigFile) {
+    let initial = ConfigFile::new(&keys_toml(&[
+        ("ro", READ_KEY, "read"),
+        ("rw", WRITE_KEY, "read-write"),
+    ]));
+    let cfg = ServerConfig::load(&initial.0).unwrap();
+    let dash_cfg = DashboardConfig {
+        addr: "127.0.0.1".into(),
+        port: 8020,
+        user: "admin".into(),
+        password: "secret".into(),
+        disable_auth: false,
+        config_file: Some(initial.0.to_str().unwrap().to_owned()),
+        ..Default::default()
+    };
+    let state = Arc::new(DashState {
+        svc: Arc::new(Service::new(cfg).unwrap()),
+        cfg: dash_cfg,
+        auth: Some(Arc::new(auth::AuthState::session_only())),
+        trusted_proxies: vec![],
+    });
+    (state, initial)
+}
+
+/// Drive one request through the router + auth middleware with a Bearer
+/// key, injecting a fixed peer like `routes_test::call`.
+async fn call_bearer(state: Arc<DashState>, req: Request<Body>) -> (StatusCode, Value) {
+    let router = routes::router(Arc::clone(&state))
+        .layer(middleware::from_fn_with_state(state, auth::auth_middleware));
+    let mut req = req;
+    req.extensions_mut().insert(ConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        12345,
+    ))));
+    let response = router.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn get_as(state: Arc<DashState>, uri: &str, key: &str) -> StatusCode {
+    call_bearer(
+        state,
+        Request::get(uri)
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .0
+}
+
+async fn reload_as(state: Arc<DashState>, key: &str) -> (StatusCode, Value) {
+    call_bearer(
+        state,
+        Request::post("/api/v1/config/reload")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn reload_api_keys_add_and_remove() {
+    let (state, file) = key_state();
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", READ_KEY).await,
+        StatusCode::OK
+    );
+    // Add a third key: reload reports `apiKeys` as changed and the new
+    // key works immediately.
+    std::fs::write(
+        &file.0,
+        keys_toml(&[
+            ("ro", READ_KEY, "read"),
+            ("rw", WRITE_KEY, "read-write"),
+            ("extra", EXTRA_KEY, "read"),
+        ]),
+    )
+    .unwrap();
+    let (status, result) = reload_as(state.clone(), WRITE_KEY).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert!(
+        result["data"]["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "apiKeys"),
+        "{result}"
+    );
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", EXTRA_KEY).await,
+        StatusCode::OK
+    );
+    // Remove the read key: it is rejected right after the reload, the
+    // others keep working.
+    std::fs::write(
+        &file.0,
+        keys_toml(&[("rw", WRITE_KEY, "read-write"), ("extra", EXTRA_KEY, "read")]),
+    )
+    .unwrap();
+    let (status, result) = reload_as(state.clone(), WRITE_KEY).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", READ_KEY).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", EXTRA_KEY).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn reload_api_keys_bad_key_is_atomic() {
+    let (state, file) = key_state();
+    // A too-short key fails the whole reload; the old keys keep working.
+    std::fs::write(
+        &file.0,
+        keys_toml(&[("ro", "short", "read"), ("rw", WRITE_KEY, "read-write")]),
+    )
+    .unwrap();
+    let (status, result) = reload_as(state.clone(), WRITE_KEY).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert!(result["msg"].as_str().unwrap().contains("too short"), "{result}");
+    assert_eq!(result["data"]["changed"], json!([]));
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", READ_KEY).await,
+        StatusCode::OK
+    );
+    // A duplicate name fails the same way.
+    std::fs::write(
+        &file.0,
+        keys_toml(&[("rw", READ_KEY, "read"), ("rw", WRITE_KEY, "read-write")]),
+    )
+    .unwrap();
+    let (status, result) = reload_as(state.clone(), WRITE_KEY).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(
+        get_as(state.clone(), "/api/v1/system/info", WRITE_KEY).await,
+        StatusCode::OK
+    );
 }

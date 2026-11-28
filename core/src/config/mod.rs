@@ -11,8 +11,8 @@ pub use client::{
 };
 pub use env::{contains_env_placeholders, expand_env_placeholders};
 pub use server::{
-    parse_host_port, DashboardConfig, QuicOptions, ServerConfig, ServerTlsConfig,
-    ServerTransportConfig, TokenPolicy,
+    parse_host_port, ApiKeyConfig, ApiKeyScope, DashboardConfig, QuicOptions, ServerConfig,
+    ServerTlsConfig, ServerTransportConfig, TokenPolicy,
 };
 
 use anyhow::Context;

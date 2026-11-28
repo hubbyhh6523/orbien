@@ -7,6 +7,7 @@ mod session_registry;
 
 use crate::access::AccessPolicy;
 use crate::control::Control;
+use crate::dashboard::api_keys::ApiKeyStore;
 use crate::metrics::MemMetrics;
 use crate::tunnel::{run_http_gw_listener, run_https_gw_listener, HttpGw, HttpsGw};
 use anyhow::{anyhow, Result};
@@ -48,6 +49,10 @@ const OFFLINE_TTL: Duration = Duration::from_secs(24 * 3600);
 pub struct Service {
     cfg: ServerConfig,
     access: Arc<RwLock<Arc<AccessPolicy>>>,
+    /// #3, slice 2: live dashboard API-key store (hash-only), swapped by
+    /// config reload like the access policy — `cfg.dashboard.api_keys` is
+    /// the startup snapshot, this is the live truth.
+    api_keys: Arc<RwLock<Arc<ApiKeyStore>>>,
     controls: Arc<Mutex<HashMap<String, Arc<Control>>>>,
     offline_clients: Arc<Mutex<HashMap<String, OfflineClientRecord>>>,
     http_gw: Option<Arc<HttpGw>>,
@@ -80,6 +85,16 @@ impl Service {
             "access policy: denySrcCidrs applies to tcp/udp tunnels, the control port and the http/https gateways; PROXY protocol applies to the tcp/http/https gateways only (not the control port, not udp); the dashboard keeps its own auth"
         );
         let access = Arc::new(RwLock::new(Arc::new(policy)));
+        // #3, slice 2: hash-only API-key store, live-swapped by reload.
+        let api_keys = Arc::new(RwLock::new(Arc::new(ApiKeyStore::from_config(
+            &cfg.dashboard.api_keys,
+        ))));
+        if !cfg.dashboard.api_keys.is_empty() {
+            tracing::info!(
+                api_keys = cfg.dashboard.api_keys.len(),
+                "dashboard API keys configured (Bearer auth, hash-only store)"
+            );
+        }
         let http_gw = if cfg.http_gw_enabled() {
             Some(Arc::new(HttpGw::new(cfg.http_gw_port)))
         } else {
@@ -106,6 +121,7 @@ impl Service {
         Ok(Self {
             cfg,
             access,
+            api_keys,
             controls: Arc::new(Mutex::new(HashMap::new())),
             offline_clients: Arc::new(Mutex::new(HashMap::new())),
             http_gw,
@@ -230,6 +246,11 @@ impl Service {
         Arc::clone(&*self.access.read().await)
     }
 
+    /// #3, slice 2: current dashboard API-key store (hash-only).
+    pub async fn api_key_store(&self) -> Arc<ApiKeyStore> {
+        Arc::clone(&*self.api_keys.read().await)
+    }
+
     fn transport_bind_addr(cfg: &ServerConfig, port: u16) -> Result<SocketAddr> {
         // Parsing only: do not resolve DNS or create an endpoint here.
         format!("{}:{port}", cfg.listen_host()?)
@@ -301,6 +322,15 @@ impl Service {
         }
 
         *self.access.write().await = Arc::new(new_policy);
+        // #3, slice 2: swap the API-key store with the same reload, so a
+        // key added to or removed from the file takes effect immediately.
+        // Validation already ran in `prepare_config`, so a bad key fails
+        // the whole reload before either store is touched.
+        let new_keys = Arc::new(ApiKeyStore::from_config(&new_cfg.dashboard.api_keys));
+        if self.api_key_store().await.fingerprint() != new_keys.fingerprint() {
+            changed.push("apiKeys".into());
+        }
+        *self.api_keys.write().await = new_keys;
         tracing::info!(changed = ?changed, "access policy reloaded");
         Ok(changed)
     }
