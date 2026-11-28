@@ -20,6 +20,10 @@ const errorText = computed(() => {
   const err = store.error
   if (!err) return ''
   if (err.code === 'http') {
+    // #3: prefer the server's message when the response carried one.
+    if (typeof err.params?.msg === 'string' && err.params.msg) {
+      return err.params.msg
+    }
     return t('errors.http', err.params ?? {})
   }
   if (err.code === 'api' && typeof err.params?.msg === 'string' && err.params.msg) {

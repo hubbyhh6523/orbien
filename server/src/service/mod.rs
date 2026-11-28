@@ -26,18 +26,18 @@ use tokio::task::JoinSet;
 pub use dashboard_view::DashboardSnapshot;
 
 pub(crate) struct OfflineClientRecord {
-    session_id: String,
-    user: String,
-    hostname: String,
-    os: String,
-    arch: String,
-    client_ip: String,
-    version: String,
-    tunnel_count: usize,
+    pub(crate) session_id: String,
+    pub(crate) user: String,
+    pub(crate) hostname: String,
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    pub(crate) client_ip: String,
+    pub(crate) version: String,
+    pub(crate) tunnel_count: usize,
     /// Wall-clock time, not `Instant`: a 24h TTL needs a timestamp that can
     /// be 25h old, and `Instant::now() - 25h` panics on a monotonic clock
     /// that started less than 25h ago (Windows CI).
-    disconnected_at: SystemTime,
+    pub(crate) disconnected_at: SystemTime,
 }
 
 /// Offline client records: at most this many, each kept for `OFFLINE_TTL`
@@ -58,6 +58,8 @@ pub struct Service {
     p2p: Arc<P2pBroker>,
     /// Pre-login connection gate (#13): caps unauthenticated connections.
     pre_login: Arc<PreLoginGate>,
+    /// #3: process start, for `system/health` uptimeSecs.
+    started_at: std::time::Instant,
 }
 
 impl Service {
@@ -115,7 +117,13 @@ impl Service {
                 limits.pre_login_max_conns,
                 limits.pre_login_max_conns_per_ip,
             ),
+            started_at: std::time::Instant::now(),
         })
+    }
+
+    /// #3: seconds since this `Service` was created.
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 
     pub async fn run(self) -> Result<()> {

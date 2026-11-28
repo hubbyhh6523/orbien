@@ -49,10 +49,15 @@ pub async fn run(svc: Arc<Service>, cfg: DashboardConfig) -> Result<()> {
         auth::AuthState::session_only()
     }));
 
+    // #3: parse once at startup (`validate()` already rejected bad entries)
+    // so the middleware never parses per request.
+    let trusted_proxies = parse_trusted_proxies(&cfg.trusted_proxies);
+
     let state = Arc::new(DashState {
         svc,
         cfg,
         auth: auth_state,
+        trusted_proxies,
     });
 
     let app = routes::router(state.clone())
@@ -70,4 +75,23 @@ pub struct DashState {
     pub cfg: DashboardConfig,
     /// Present when WebAuthn is configured; `None` → Basic Auth only.
     pub auth: Option<Arc<auth::AuthState>>,
+    /// #3: parsed `dashboard.trustedProxies` (IPs/CIDRs). Empty means direct
+    /// mode — forwarding headers are never trusted.
+    pub trusted_proxies: Vec<orbien_core::net::Cidr>,
+}
+
+/// #3: parse the configured trusted proxies. Unparsable entries are skipped
+/// with a warning — `validate()` already refuses them at startup, so this
+/// only fires for states built without validation (tests).
+fn parse_trusted_proxies(entries: &[String]) -> Vec<orbien_core::net::Cidr> {
+    entries
+        .iter()
+        .filter_map(|e| match orbien_core::net::Cidr::parse(e) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                tracing::warn!(entry = %e, "ignoring unparsable dashboard.trustedProxies entry: {err}");
+                None
+            }
+        })
+        .collect()
 }
